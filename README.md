@@ -64,3 +64,58 @@ if __name__ == '__main__':
     res = apply_rotary_emb(xq, xk, freqs_cis)
 ```
 
+### RMSNorm
+
+#### 基础概念
+
+归一化的核心目标是缓解内部协变量偏移问题，即网络中间层输入分布随参数更新而发生改变。主要有以下好处：
+
+1、**提升训练效率**：归一化使每一层的输入分布更加稳定，从而允许使用更高的学习率，加快收敛速度。
+
+2、**保持梯度稳定**：通过控制激活值的尺度，减少梯度消失或者梯度爆炸，适合深层网络的训练。
+
+3、**引入归纳偏置**：归一化在一定程度上对输入进行标准化，降低了模型对输入尺度的敏感性，增强了泛化能力。
+
+#### 核心优势
+
+为什么现在的大模型都用RMSNorm，而不使用BatchNorm和LayerNorm？
+
+1、任务特性不匹配：
+	大模型多用于NLP，输入为变长序列，BatchNorm依赖batch统计量，在batch size小和序列长度不固定时不稳定。
+
+​	LayerNorm和RMSNorm按样本独立归一化，天然适配序列建模。
+
+2、训练稳定性：
+
+​	BathNorm在训练和推理阶段行为不同（训练用batch统计量，推理用移动平均），引入不确定性。
+
+​	LayerNorm和RMSNorm训练推理一致，更稳定。
+
+3、可扩展性与效率：
+
+​	BatchNorm在分布式训练中需跨设备同步统计量，通信开销大。
+
+​	LayerNorm和RMSNorm无需跨batch统信，更适合大规模并行训练。
+
+​	RMSNorm进一步简化计算（只有缩放因子gemma，没有中心化beta），减少参数量，提高吞吐。
+
+#### 手撕代码
+
+```python
+import torch
+from torch import nn
+
+class RMSNorm(torch.nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weights = nn.Parameter(torch.ones(dim))
+        
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim = True) + self.eps) 
+    
+    def forward(self, x):
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weights
+```
+
