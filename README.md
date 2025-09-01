@@ -119,3 +119,70 @@ class RMSNorm(torch.nn.Module):
         return output * self.weights
 ```
 
+### 归一化模块位置的影响
+
+|特征|PostNorm| PreNorm |
+| :-:  | :-:  | :-:  |
+| 归一化位置 | 残差连接之后 | 残差连接之前 |
+|  公式形式  |    y = Norm( x + F(x) )    | y = F( Norm( x ) ) +  x |
+|  梯度传播  | 初始阶段梯度较大，后期稳定 | 梯度更平滑，训练更稳定 |
+| 收敛速度 | 较慢，需小心调参 | 更快，对学习率更鲁棒 |
+| 最终性能 | 可达最优，但训练难度高 | 更易训练，性能更稳定 |
+
+大模型使用PreNorm的优势：
+每个子层输入都被归一化，信号尺度更可控。
+
+残差连接保持“恒等映射”主导，梯度传播更平滑。
+
+显著提升训练稳定性，尤其在深层网络中。
+
+### MHA多头注意力机制
+
+#### 基础概念
+
+$$
+\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V
+$$
+
+因为这里矩阵的点积，是对矩阵元素逐个相乘再相加，如果序列过长会导致结果过大，除以sqrt（d）是为了进行缩放，防止点积结果过大导致softmax函数梯度消失。
+
+#### 手撕代码
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, dim:int, head_num: int):
+        super().__init__()
+        self.dim = dim
+        self.head_num = head_num
+        assert self.dim % head_num == 0
+        self.head_dim = self.dim // self.head_num
+        
+        self.q = nn.Linear(dim, dim)
+        self.k = nn.Linear(dim, dim)
+        self.v = nn.Linear(dim, dim)
+        
+        self.fc = nn.Linear(dim, dim)
+    def forward(self, x, mask = None):
+        b, s, d = x.shape
+        
+        q = self.q(x).view(b, s, self.head_num, self.head_dim).transpose(1, 2)
+        k = self.k(x).view(b, s, self.head_num, self.head_dim).transpose(1, 2)
+        v = self.v(x).view(b, s, self.head_num, self.head_dim).transpose(1, 2)
+        
+        attn_score = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        
+        if mask is not None:
+            attn_score = attn_score.masked_fill(mask == 0, -1e9)
+            
+        attn_weight = F.softmax(attn_score, dim = -1)
+        output = torch.matmul(attn_weight, v)
+        
+        output = output.transpose(1, 2).contiguous().view(b, s ,d)
+        
+        return self.fc(output)
+```
+
