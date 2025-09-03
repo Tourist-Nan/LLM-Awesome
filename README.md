@@ -144,7 +144,11 @@ $$
 \text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V
 $$
 
-因为这里矩阵的点积，是对矩阵元素逐个相乘再相加，如果序列过长会导致结果过大，除以sqrt（d）是为了进行缩放，防止点积结果过大导致softmax函数梯度消失。
+因为这里矩阵的点积，是对矩阵元素逐个相乘再相加，如果序列过长会导致结果过大，除以sqrt（d）是为了进行缩放，防止点积结果过大导致softmax函数梯度消失。简单来说，就是需要压缩softmax输入值，以免输入值过大，进入了softmax的饱和区，导致梯度值太小而难以训练。
+
+#### 核心优势
+
+多个头能够在训练中学会注意到不同的内容。例如在翻译任务中，一些attention head可以关注语法特征，另一些attention head可以关注单词特性。这样模型就可以从不同角度来分析和理解输入信息。
 
 #### 手撕代码
 
@@ -184,5 +188,94 @@ class MultiHeadAttention(nn.Module):
         output = output.transpose(1, 2).contiguous().view(b, s ,d)
         
         return self.fc(output)
+```
+
+### 解码中的KV Cache
+
+1、**什么是 KV cache？**
+
+在 Transformer 推理中，把历史生成的 **Key (K)** 和 **Value (V)** 缓存在显存里，供后续新 token 的注意力计算使用。
+
+2、**KV 的优势是什么？**
+
+避免重复计算历史 token 的 K/V，大幅降低推理开销；prefill 阶段后，每一步只需计算新 token 的 Q，再用缓存的 K/V，就能做到 **从 O(n²) 降到 O(n)** 的计算量。
+
+3、**为什么缓存 K/V，而不缓存 Q？**
+
+- Q 只对当前 token 生效，用完即弃，不会在未来复用。
+
+- K/V 会被所有后续 token 的注意力查询重复使用，所以必须缓存。
+
+### MQA多Query注意力机制
+
+#### 基础概念
+
+MQA 是对 **多头注意力（Multi-Head Attention, MHA）** 的一种优化：
+
+**传统 MHA**：每个头都有独立的 Q、K、V 投影矩阵，每个头的 Key/Value 都单独计算并缓存。
+
+**MQA**：每个头仍然有自己的 **Q**（保持不同注意力模式），但 **所有头共享同一份 K/V**。
+
+这样，每个头使用不同的 Q 对同一份 K/V 做注意力计算，显著减少计算量和显存占用。
+
+#### 核心优势
+
+1. **显存占用大幅降低**
+   - 推理时需要缓存 KV（KV cache）以加速生成。
+   - MHA 每个头都要缓存 K/V，显存占用高；MQA 只缓存一份 K/V，显存降低约为头数倍。
+2. **推理速度更快**
+   - KV 只计算一次，多头共享，减少重复计算，尤其对长序列生成效果明显。
+
+#### 手撕代码
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MultiQueryAttention(nn.Module):
+    def __init__(self, dim: int, head_num: int):
+        super().__init__()
+        self.dim = dim
+        self.head_num = head_num
+        assert self.dim % head_num == 0
+        self.head_dim = self.dim // self.head_num
+        
+        # Q 仍然有多个 head
+        self.q = nn.Linear(dim, dim)
+        # K 和 V 只有一个 head，由所有 query heads 共享
+        self.k = nn.Linear(dim, self.head_dim)
+        self.v = nn.Linear(dim, self.head_dim)
+        
+        self.fc = nn.Linear(dim, dim)
+        
+    def forward(self, x, mask=None):
+        b, s, d = x.shape
+        
+        # Q 有多个 head: (batch, head_num, seq_len, head_dim)
+        q = self.q(x).view(b, s, self.head_num, self.head_dim).transpose(1, 2)
+        
+        # K 和 V 只有一个 head: (batch, seq_len, head_dim)
+        k = self.k(x)  # (b, s, head_dim)
+        v = self.v(x)  # (b, s, head_dim)
+        
+        # 将 K 和 V 扩展到所有 head: (batch, head_num, seq_len, head_dim)
+        k = k.unsqueeze(1).expand(b, self.head_num, s, self.head_dim)
+        v = v.unsqueeze(1).expand(b, self.head_num, s, self.head_dim)
+        
+        # 计算注意力分数
+        attn_score = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        
+        if mask is not None:
+            attn_score = attn_score.masked_fill(mask == 0, -1e9)
+            
+        attn_weight = F.softmax(attn_score, dim=-1)
+        output = torch.matmul(attn_weight, v)
+        
+        # 重新组合所有 head 的输出
+        output = output.transpose(1, 2).contiguous().view(b, s, d)
+        
+        return self.fc(output)
+
 ```
 
