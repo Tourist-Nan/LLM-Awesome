@@ -279,3 +279,66 @@ class MultiQueryAttention(nn.Module):
 
 ```
 
+### GQA组注意力机制
+
+把多个头划分成若干组（group），**每组内的头共享同一份 K/V**，但不同组之间的 K/V 还是独立的。
+
+#### 手撕代码
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class GroupedQueryAttention(nn.Module):
+    def __init__(self, dim: int, head_num: int, kv_head_num: int):
+        super().__init__()
+        self.dim = dim
+        self.head_num = head_num
+        self.kv_head_num = kv_head_num
+        
+        assert self.dim % head_num == 0
+        assert head_num % kv_head_num == 0, "head_num must be divisible by kv_head_num"
+        
+        self.head_dim = self.dim // self.head_num
+        self.group_size = self.head_num // self.kv_head_num  # 每组的 query head 数量
+        
+        # Q 有 head_num 个 head
+        self.q = nn.Linear(dim, dim)
+        # K 和 V 有 kv_head_num 个 head
+        self.k = nn.Linear(dim, kv_head_num * self.head_dim)
+        self.v = nn.Linear(dim, kv_head_num * self.head_dim)
+        
+        self.fc = nn.Linear(dim, dim)
+        
+    def forward(self, x, mask=None):
+        b, s, d = x.shape
+        
+        # Q: (batch, head_num, seq_len, head_dim)
+        q = self.q(x).view(b, s, self.head_num, self.head_dim).transpose(1, 2)
+        
+        # K, V: (batch, kv_head_num, seq_len, head_dim)
+        k = self.k(x).view(b, s, self.kv_head_num, self.head_dim).transpose(1, 2)
+        v = self.v(x).view(b, s, self.kv_head_num, self.head_dim).transpose(1, 2)
+        
+        # 将 K 和 V 重复以匹配 Q 的 head 数量
+        # 每个 KV head 对应 group_size 个 Q head
+        k = k.repeat_interleave(self.group_size, dim=1)  # (batch, head_num, seq_len, head_dim)
+        v = v.repeat_interleave(self.group_size, dim=1)  # (batch, head_num, seq_len, head_dim)
+        
+        # 计算注意力分数
+        attn_score = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        
+        if mask is not None:
+            attn_score = attn_score.masked_fill(mask == 0, -1e9)
+            
+        attn_weight = F.softmax(attn_score, dim=-1)
+        output = torch.matmul(attn_weight, v)
+        
+        # 重新组合所有 head 的输出
+        output = output.transpose(1, 2).contiguous().view(b, s, d)
+        
+        return self.fc(output)
+
+```
+
