@@ -342,3 +342,177 @@ class GroupedQueryAttention(nn.Module):
 
 ```
 
+## RLHF（**基于人类反馈的强化学习**）
+
+### PPO
+
+PPO代表近端策略优化，它需要以下组件：
+
+1、策略（Actor、Policy）模型（$\pi_{\theta}$）：经过预训练或SFT后的模型，该模型是可学习的，需要打开训练。
+
+2、约束模型（$\pi_{ref}$）：该模型是冻结的，不需要参与训练，用来做KL散度约束，用来防止Actor模型的分布偏离原始模型太远。
+
+3、奖励模型（$R_{\phi}$）：一个经过训练并冻结的模型，它为给定 prompt 的**完整响应**提供奖励分值，有时不需要，基于规则也可以给奖励。
+
+4、价值模型（$V_{\Phi}$）：它是一个可学习的模型，它为给定 prompt 的**部分响应**提供奖励分值。
+
+![img](https://p.ipic.vip/wqdjwt.jpg)
+
+PPO的整个流程包含以下六个部分：
+
+1、**生成响应**：LLM为给定单个prompt生成单个响应；
+
+2、**响应打分**：奖励模型为每个响应分配奖励；
+
+3、**响应价值**：价值模型给出多步响应对应的价值
+
+4、**计算优势**（**advantages**）：使用 **GAE**（广义优势估计）计算优势；
+
+5、**优化策略（policy）：**通过优化总目标来更新 LLM；
+
+6、**更新价值函数（critic）**：训练价值函数，使其更好地预测给定部分响应的奖励。
+
+#### 广义优势估计（GAE）
+
+我们的策略通过优化**优势函数（advantage function）**来更新。直观地讲，优势函数定义了在特定状态$s_{t}$（即提示 prompt + 到目前为止生成的词）下**选择某个动作**$a_{t}$（即词）**相较于平均动作的优越程度**。优势函数的定义如下：
+$$
+A_{t} = Q(s_{t}, a_{t}) - V(s_{t})
+$$
+$Q(s_{t}, a_{t}))$: **动作价值（action value）**，表示在状态$s_{t}$下选择动作$a_{t}$的期望回报；
+
+$V(s_{t})$: **状态价值（state value）**，表示状态$s_{t}$下的期望回报。
+
+为了估计这个优势函数$A_t$，通常有两种主要方法，每种方法都有其优缺点：
+
+- **蒙特卡洛方法（Monte-Carlo, MC）**：
+
+- - **方法**：使用完整轨迹的奖励（即完整响应的奖励）来估计优势。
+  - **优点**：这种方法具有**低偏差（low bias）**，因为它能准确地反映完整轨迹的真实奖励。
+  - **缺点**：由于**奖励稀疏**，需要采样足够多的完整轨迹才能进行优化。这会导致**高方差（high variance）**，并且代价昂贵。
+
+- **时序差分方法（Temporal Difference, TD）**：
+
+- - **方法**：使用一步轨迹奖励（即刚生成的 token 的奖励）来估计优势。
+  - **优点**：这种方法能在 token 级别计算奖励，显著减少了方差（low variance）。
+  - **缺点**：由于无法准确预测完整响应的最终奖励，这种方法会引入较高的偏差（high bias）。
+
+- 为了在偏差和方差之间取得平衡，引入了 General Advantage Estimation (GAE)。GAE 通过多步 TD 来实现这一目标。
+
+TD误差（步长为1）：$\delta_{t} = R_{t+1} + \gamma V_{\Phi}(s_{t+1}) - V_{\Phi}(s_{t})$
+
+GAE（步长为n）：
+$$
+\begin{align*}
+A_{t}^{n} &= R_{t+1} + \gamma^2 R_{t+2} + \dots + \gamma^n V_{\Phi}(s_{t+n}) - V_{\Phi}(s_{t}) \\
+          &= \sum_{l=1}^{n} \gamma^{l-1} \delta_{t+l-1}
+\end{align*}
+$$
+最终形式：$A_{t}^{\text{GAE}} = \sum_{l=0}^{\infty} (\gamma\lambda)^{l} \delta_{t+l}$
+
+PPO 的主要目标是最大化 advantage（$A_{t}^{\text{GAE}}$ ） 地方，也就是说，我们希望让 LLM 生成的每一个 token 都能够最大化 reward（或者说，最大化 advantage——即每个 token 要比它“平均水平”的表现更好）。这个目标通过以下公式实现：
+$$
+\mathcal{L}_{\text{clip}}(\theta) = \mathbb{E}_{t}\left[\min\left(c_{t}(\pi_{\theta})A_{t}^{\text{GAE}}, \operatorname{clip}(c_{t}(\pi_{\theta}), 1 - \epsilon, 1 + \epsilon)A_{t}^{\text{GAE}}\right)\right]
+$$
+$c_{t}(\pi_{\theta}) = \frac{\pi_{\theta}(a_{t} | s_{t})}{\pi_{\theta_{\text{old}}}(a_{t} | s_{t})}$: 是在给定累计状态 $s_t$下，策略更新前后的概率比值；
+
+$\epsilon$: 是一个超参数，用于控制 clip 范围；
+
+$A_{t}^{\text{GAE}}$: 是之前通过 GAE 计算得到的优势值。
+
+#### Critic loss
+
+理论上，我们并没有办法获得真实的折扣回报，因此无法获取 Critic 的明确标签。而在 Actor-Critic 范式中使用包含了真实奖励的折扣回报$\hat{G_t}$ 作为标签。下面是 Critic loss 的计算公式：
+$$
+\mathcal{L}(\Phi) = \mathbb{E}_{t}\left[\max\left(\left(V_{\Phi}(s_{t}) - \hat{G}_{t}\right)^2, \left(\operatorname{clip}\left(V_{\Phi}(s_{t}), V_{\Phi}^{\text{old}}(s_{t}) - \epsilon, V_{\Phi}^{\text{old}}(s_{t}) + \epsilon\right) - \hat{G}_{t}\right)^2\right)\right]
+$$
+
+#### KL散度
+
+除了最大化 advantage，PPO 还引入了 KL 惩罚，防止当前策略偏离我们微调前的原始模型太远：
+$$
+\text{KL}(\theta) = \mathbb{E}_{s_t}\left[\mathbb{D}_{\text{KL}}\left(\pi_{\theta}(\cdot|s_t) \| \pi_{\text{ref}}(\cdot|s_t)\right)\right]
+$$
+
+$$
+\mathbb{D}_{KL}(P \| Q) = \sum_{x} P(x) \log \frac{P(x)}{Q(x)}
+$$
+
+在计算 KL 散度时需要计算两个模型在整个词表上的概率，为了简化计算过程，在实现时通常采用近似计算。如下图所示
+
+![img](https://p.ipic.vip/9cvd0e.jpg)
+
+#### 熵奖励（Entropy Bonus）
+
+熵奖励用于鼓励 LLM 探索更多的输出，而不是一味选择概率最高的词：$H(\theta) = -\mathbb{E}_{a_i \sim \pi_{\theta}}\left[\log \pi_{\theta}(a_i | s)\right]$
+
+PPO最终的损失loss：
+![image-20250909222233990](https://p.ipic.vip/emjd2u.png)
+
+### GRPO
+
+GRPO 相较于 PPO 的主要改进为：
+
+- 使用对同一问题的多个采样输出的平均奖励作为基线**；**
+- 优势计算中去掉了对值函数$V_{\Phi}(s_{t})$的依赖**。**
+
+下面是 GRPO 计算 advantage 的具体流程：
+
+- **采样多个响应**：对每个 prompt，采样一组 response：$r = \{r_{1}, r_{2}, \dots, r_{G}\}$
+
+- **通过 Reward Model 打分**：对每个响应$r_i$，使用奖励模型$R_{\phi}(r_{i})$得到一个分数。对应的产生$G$个奖励分值为$r = \{R_{1}, R_{2}, \dots, R_{G}\}$
+- **用 group 内标准化估计 Advantage**：$A_{i,t} = R_{i} = \frac{R_{\phi}(r_{i}) - \text{mean}(R)}{\text{std}(R)}$
+
+下面是 GRPO 的具体流程，对比图PPO 的流程，二者的主要区别在于 advantage 的计算。
+
+![img](https://p.ipic.vip/9owr8k.jpg)
+
+### DAPO
+
+DAPO 的出发点非常直接：在实际训练中，GRPO 往往因 clip 范围设置不合理、采样冗余以及长序列梯度被稀释等问题，导致大量训练信号被浪费。针对这些问题，DAPO 逐一提出改进，形成了四个核心优化点。
+$$
+\begin{align*}
+\mathcal{J}_{\text{DAPO}}(\theta) = \; & \mathbb{E}_{\substack{(q,a) \sim P(Q) \\ \{o_i\}_{i=1}^G \sim \pi_{\theta_{\text{old}}}(O|q)}} \left[ \frac{1}{\sum_{i=1}^{G} |o_i|} \sum_{i=1}^{G} \sum_{t=1}^{|o_i|} \right. \\
+& \left. \min\left(r_{i,t}(\theta)A_i, \operatorname{clip}(r_{i,t}(\theta), 1 - \epsilon_{\text{low}}, 1 + \epsilon_{\text{high}})A_i\right) \right] \\
+& \text{s.t.,} \quad 0 < \left| \{o_i \mid \text{is\_equivalent}(a, o_i)\} \right| < G
+\end{align*}
+$$
+
+
+#### 为什么 DAPO 提高了 $ 1 + \epsilon_{high}$  的上界？
+
+作者发现，如果 clip 的上界$\epsilon$设置过小，会出现这样的问题：当 old policy 对某个 token 的概率很低，而该 token 的 advantage 又是正值（即 old model 恰好采样得非常好），此时当前 policy model 的上涨空间就会受到很大限制，而上涨恰恰是我们希望发生的。
+
+举例来说，如果 old policy 的概率是 0.9， $\epsilon = 0.2$，clip 上界为$0.9 \times 1.2 = 1.08$ ，已超过概率的最大值 1.0，这种情况是绝对不会被 clip 的；但如果 old policy 的概率是 0.2，clip 上界仅为 0.24，即便当前模型将其概率提升到 0.4（一个不是非常激进且恰到好处的改进），也会因$\epsilon$过小而被 clip，导致该 token 的训练信号被废弃。为了解决这一问题，DAPO 引入 **Clip-Higher**，提高上界以提升 token 利用效率。
+
+这类似于“马太效应”——*富人越来越富，穷人很难翻身*。如果 old policy 难得采到一个关键 token（例如 `「Wait」`）且概率极低，而当前模型对此 token 的概率提升显著，却因为 clip 限制过紧被抹掉，那么模型几乎没有翻盘的机会。
+
+Clip-Higher 解决了“好 token 涨幅受限”的问题，但并未触及另一个浪费来源——采样多样性不足。为此，DAPO 引入了 **动态采样**。
+
+#### DAPO - 动态采样
+
+DAPO 的第二个创新是 **动态采样**（Dynamic Sampling）。这项技术的背景是：假如一个 query 我们 sample 了 10 次，这 10 次每次都答得很好/或者很差，都取得了 max reward/zero reward，这个时候由于 GRPO 的计算方法，导致这 10 次采样的 advantage 都是 0，所以这些采样所带来的 gradient 就也都是 0；这样做的一个后果就是，实际的有梯度的 sample 要远低于名义 sample 数，导致最后梯度汇集的时候没有收集到足够的信息，从而形成高方差、不稳定的训练，以及 sample 的浪费。需要注意的是，这种现象是在训练初期；以及后期随着训练的进行在不断加强的，因为刚开始时模型效果很差，而训练越到后边模型效果越好，给出满分回答的几率就越大。因此，DAPO 在采集样本时，额外做了一件事：保证每次采样出来的回答，reward 不全是 0 或者 1，如果采样出来的回答全是 0 或者 1 就继续采样，直到不满足为止。这也是损失函数中$\text{s.t.,} \quad 0 < \left| \{o_i \mid \text{is\_equivalent}(a, o_i)\} \right| < G$的来源，它保证同一输入下的采样集合中既包含正确回答，也包含错误回答。
+
+除了多样性问题，GRPO 在长回答训练中还有一个隐性缺陷——**token 梯度权重随回答长度增加而被稀释**。DAPO 的第三个改进正是 **Token-Level Gradient Loss**。
+
+#### DAPO - Token-Level Gradient Loss
+
+DAPO 第三个方面的创新是为了解决 GRPO 在训练长回答时 gradient 的权重会随着采样回答的长度变长而下降的问题。首先解释为什么采样长度变长权重会下降。假设采样了 2 次，有一次回答一共有 200 个 token，而另一次回答有 10 个 token。那么根据 GRPO 的计算公式，每次回答的梯度先在 sample 内求平均，再在 batch 内求平均。第一次回答每个 token 的权重是$(1/200) * (1/2)$，而第二个回答每个 token 的权重是$(1/10) * (1/2)$，所以第二次回答的 token 的影响要明显高于第一次回答。再来说采样长度变长权重下降的危害：对于一些比较难的问题，长回答本身就很正常，如果这些回答本身非常好，那么由于长度平均就会导致本来非常有用的梯度信号被稀释；假如回答是不好的，长度长仅仅也是因为重复单词，或者回答冗余词太多，长度归一就导致这次采样本该带来的纠正信号没法正确传递到 policy model 上。总结来说就是：
+
+这会带来两个问题：
+
+1. **长高质量回答**的有用信号被稀释；
+2. **长低质量回答**的纠正信号也被稀释（长只是因为冗余或重复）。
+
+所以 DAPO 采用的方法是：把一次梯度计算时所有采样生成的 token 总数加起来求平均，回到上边这个例子，第一次采样和第二次采样每个 token 的权重都是 $(1/200) * (1/2)$，即对不同回答中的 token 一视同仁。这样就能改善 GRPO 在长样本训练中的效率低下的问题。这对应着损失函数中的改变，公式上，对于 loss 的 aggregation 方式由原来 GRPO 的$\frac{1}{G} \sum_{i=1}^{G} \frac{1}{|o_i|} \sum_{t=1}^{|o_i|}$改为$\frac{1}{\sum_{i=1}^{G} |o_i|} \sum_{i=1}^{G} \sum_{t=1}^{|o_i|}$
+
+实验证明，token-level loss 不仅训练更稳定，还能有效控制 entropy：过高会导致策略趋于随机，过低则探索不足（Clip-Higher 可缓解该问题）。通过将 sample-level loss 改为 token-level loss，DAPO 让长回答能够按比例影响最终梯度，每个 token 的损失都直接参与整体更新。
+
+最后一个改进同样与回答长度相关，但关注点不同——它处理的是**过长回答对整体奖励的负面影响**。
+
+#### DAPO - Overlong Reward Shaping
+
+DAPO 的第四个改进是在奖励设计中引入 **软惩罚机制**（Soft Punishment）来处理过长回答。具体来说，当生成长度超过第一个预设阈值时，惩罚会随长度线性增加；一旦超过第二个阈值，惩罚将抵消因回答正确获得的所有奖励，相当于将该回答视为无效。这种惩罚是按 token 作用在 reward（即 advantage）上的。
+
+综上，DAPO 在 **Clip-Higher、动态采样、Token-Level Gradient Loss** 和 **Overlong Reward Shaping** 四个方面，对 GRPO 进行了精细化改造，显著提升了训练的效率与稳定性。不过在某些特定架构（尤其是 MoE）下，GRPO 的结构性问题依然存在，这就引出了下一节的 **GSPO**。
+
+### GSPO
