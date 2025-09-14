@@ -505,6 +505,9 @@ DAPO 第三个方面的创新是为了解决 GRPO 在训练长回答时 gradient
 
 所以 DAPO 采用的方法是：把一次梯度计算时所有采样生成的 token 总数加起来求平均，回到上边这个例子，第一次采样和第二次采样每个 token 的权重都是 $(1/200) * (1/2)$，即对不同回答中的 token 一视同仁。这样就能改善 GRPO 在长样本训练中的效率低下的问题。这对应着损失函数中的改变，公式上，对于 loss 的 aggregation 方式由原来 GRPO 的$\frac{1}{G} \sum_{i=1}^{G} \frac{1}{|o_i|} \sum_{t=1}^{|o_i|}$改为$\frac{1}{\sum_{i=1}^{G} |o_i|} \sum_{i=1}^{G} \sum_{t=1}^{|o_i|}$
 
+$$
+
+$$
 实验证明，token-level loss 不仅训练更稳定，还能有效控制 entropy：过高会导致策略趋于随机，过低则探索不足（Clip-Higher 可缓解该问题）。通过将 sample-level loss 改为 token-level loss，DAPO 让长回答能够按比例影响最终梯度，每个 token 的损失都直接参与整体更新。
 
 最后一个改进同样与回答长度相关，但关注点不同——它处理的是**过长回答对整体奖励的负面影响**。
@@ -516,3 +519,47 @@ DAPO 的第四个改进是在奖励设计中引入 **软惩罚机制**（Soft Pu
 综上，DAPO 在 **Clip-Higher、动态采样、Token-Level Gradient Loss** 和 **Overlong Reward Shaping** 四个方面，对 GRPO 进行了精细化改造，显著提升了训练的效率与稳定性。不过在某些特定架构（尤其是 MoE）下，GRPO 的结构性问题依然存在，这就引出了下一节的 **GSPO**。
 
 ### GSPO
+
+如果说 **DAPO** 是在 GRPO 框架内做“微调与优化”，那么 **GSPO** 则是直接调整了优化目标的颗粒度——从 *token-level* 跳到 *sequence-level*。这一变化的动机，主要源于在 MoE 架构训练时，GRPO 的重要性采样会引入巨大方差和不稳定性。GSPO 的核心思想是：优化奖励时不再依赖逐个 token 的比值，而是关注整个生成序列的表现，从而降低噪声并提升稳定性。
+
+#### Importance ratio 到底在起什么作用？在 GRPO 里会带来什么问题？
+
+重要性采样存在的意义在于：我们想要估计一个预期的分布，但是我们手上只有另一个 behavior 分布，我们就只能在 behavior policy 下进行采样，通过这个样本，赋予这个重要性权重，来估计出 target policy 下函数的值。但是这种采样的前提在于多次采样，如果只有一次采样，并不能起到分布矫正的作用。问题在于大模型训练过程中，重要性采样都是 per-token 进行的，单个 token 进行的重要性采样是无法起到分布矫正的作用的，相反，这种采样手段反而会带来很大方差的噪声，尤其是在 MoE 这种不稳定的结构下。所以 GRPO 本身这种逐 token 的计算可能不太合理。
+
+Per-token 采样和奖励回复的不匹配：我们的奖励其实是对每个回答整体给出的评价，但是在 per-token 的操作中，我们又把这个奖励平摊到每个 token 上（reward shaping），然后试图在 token 层面逐个做调整，所以这里就发生了一个**优化的目标和奖励目标的颗粒度的差异**。所以既然我们有了 sequence-level 的 reward，我们能不能也把 GRPO 的优化过程改成 sequence-level 的。
+
+#### GRPO 在 MoE 结构上为什么难以收敛？(GRPO 的局限性)
+
+**专家激活波动性**是关键问题。因为新旧策略可能激活不同的专家，带来结构性偏差，引起噪声。当更新时${\pi_{{\theta}_{old}}}$，很有可能 Router 也发生了变化，导致新旧策略激活了不同的专家。虽然模型参数只更新了一步，但实际参与计算的专家组合完全不同，导致非常大的输出概率的波动，**导致 clipping 被异常地、频繁地触发。Clip 过后的 token 往往就没有梯度**，而最终留下来的 token 往往是有噪音的。所以这两个概率根本不是在相同结构下产生的，理想中的重要性比率应该反应模型在同一结构下参数变化导致的输出概率变化，但这个比率现在由于专家变化，导致高方差的波动，不可预测，与优化方向无关的噪声。这种高方差会导致梯度估计严重失真，训练不稳定甚至崩溃。
+
+#### GSPO 之前的做法：Routing Replay
+
+Routing Replay 会记录 ${\pi_{{\theta}_{old}}}$ 推理时的路由激活，并在训练时强制 ${\pi_{\theta}}$ 使用相同激活路径。这虽能保证一致性，但对 AI infra 带来非常大的开发工作量和开销；同时对于${\pi_{\theta}}$ ，有可能已经有了更好的 routing path，但是现在却一定要走 的 routing path，导致 training 不是很高效。传统方法会尝试通过 Routing Replay 来缓解专家激活的不一致，但这会带来工程复杂性与效率损失。GSPO 则选择直接规避这一依赖，从根本上降低了训练过程中的结构性方差。
+
+#### GSPO 的损失函数设计
+
+$$
+\mathcal{J}_{\text{GSPO}}(\theta) = \mathbb{E}_{x \sim \mathcal{D}, \{y_i\}_{i=1}^G \sim \pi_{\theta_{\text{old}}}(\cdot|x)} \left[ \frac{1}{G} \sum_{i=1}^G \min \left( \left( \frac{\pi_\theta(y_i|x)}{\pi_{\theta_{\text{old}}}(y_i|x)} \right)^{\frac{1}{|y_i|}} \hat{A}_i, \text{clip}\left(\left( \frac{\pi_\theta(y_i|x)}{\pi_{\theta_{\text{old}}}(y_i|x)} \right)^{\frac{1}{|y_i|}}, 1-\epsilon, 1+\epsilon\right) \hat{A}_i \right) \right]
+$$
+
+$$
+s_i(\theta) = \left( \frac{\pi_\theta(y_i|x)}{\pi_{\theta_{\text{old}}}(y_i|x)} \right)^{\frac{1}{|y_i|}} = \exp \left( \frac{1}{|y_i|} \sum_{t=1}^{|y_i|} \log \frac{\pi_\theta(y_{i,t}|x, y_{i,<t})}{\pi_{\theta_{\text{old}}}(y_{i,t}|x, y_{i,<t})} \right).
+$$
+
+GSPO 的算法希望抛弃掉 GRPO 的 token-level objective，而是把 importance rate 直接用在 sequence-level 上，这也就自然得引入了 GSPO 的优化算法目标，即把 token-level 的 importance rate 换成了 sequence-level 的 importance rate。这里对 sequence-level 的重要性做了长度归一化，**这里主要是为了减少方差和统一数值范围。如果不做长度归一化，不同的问题可能回答长度是不一样的，因此 importance rate 可能会对长度很敏感**。这里，由于所有属于同意采样的 token 用到的 importance ratio 都是一样的，所以一旦 clipping 发生，所 clip 掉的将是整个采样到的 sequence，而不是一次采样中的某些 token。长度归一化 $\frac{1}{|y_i|}$  避免长句子几个 token 波动就导致 ratio 爆炸。
+
+#### GSPO 与 GRPO 在梯度上的理论分析
+
+从优化目标的定义出发，GSPO 与 GRPO 的主要区别在于重要性比值的定义及其在梯度计算中的作用。
+
+如果忽略掉 clip 机制，那么二者梯度本质上的区别在于，是否要对一个回复里边的不同 token，他们的梯度做加权平均。GRPO 是会对一个回复里边的不同 token 根据他们各自的重要性权重做加权，但是 GSPO 对一整个句子做相同 importance ratio 的放缩。具体而言，GSPO 的梯度为：
+$$
+\nabla_\theta J_{\text{GSPO}}(\theta) = \mathbb{E} \left[ \frac{1}{G} \sum_{i=1}^G s_i(\theta) A_i \cdot \frac{1}{|o_i|} \sum_{t=1}^{|o_i|} \nabla_\theta \log \pi_\theta(o_{i,t} \mid q, o_{i,<t}) \right].
+$$
+可以看出，GSPO 对同一条回复中的所有 token 赋予相同的权重 $s_i(\theta) A_i / |o_i|$ ，从而保证了序列内部梯度权重的一致性。相比之下，GRPO 的梯度为：
+$$
+\nabla_\theta J_{\text{GRPO}}(\theta) = \mathbb{E} \left[ \frac{1}{G} \sum_{i=1}^{G} \frac{\hat{A}_i}{|o_i|} \sum_{t=1}^{|o_i|} r_{i,t}(\theta) \nabla_\theta \log \pi_\theta(o_{i,t} \mid q, o_{i,<t}) \right].
+$$
+可以看出，GRPO 在同一条回复的不同 token 上采用不同的权重 $r_{i,t}(\theta)\frac{\hat{A}_i}{|o_i|}$ ，这些权重会随 token 位置和上下文变化而波动，且可能出现较大方差，尤其在长序列或 MoE 模型中更为严重。
+
+另外一个区别在于 GRPO 原本的重要性采样权重对 clip 范围的影响。对于大于零的 advantage 的样本，GRPO 允许的范围是零到一点几，但是对于 advantage 小于 0 的样本，clip 的数值范围是零点几到正无穷，这是个很大的波动范围。当序列变长的时候，这个时候所携带的噪声是会不断积累的。这也是 MoE 模型在用 GRPO 训练时候崩溃的原因之一。而 Reward 监控指标对于模型学偏这件事情是有一定滞后性的，就是模型学偏了一段时间以后，指标上才会有反馈。从实验结果上来看，GSPO 实际用于训练的 token 比 GRPO 少很多（由于 clipping），但同时达到了更高的训练效率。
