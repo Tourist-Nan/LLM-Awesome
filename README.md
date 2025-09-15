@@ -342,6 +342,50 @@ class GroupedQueryAttention(nn.Module):
 
 ```
 
+### MLA多头隐藏空间注意力
+
+
+
+### SwiGLU激活函数
+
+#### 基础概念
+
+公式为$\text{SwiGLU}(a, b) = a \otimes \text{Swish}(b)$，SwiGLU由Swish激活函数和门控线性单元（GLU）组成，有通过门控过滤信息的特性。
+
+#### 核心优势
+
+**平滑性：**Swish函数的平滑性，比ReLU、Leaky Relu更平滑，处处可导，有利于模型更稳定、收敛速度更快；
+
+**非单调性：**Swish函数的非单调性，能够捕捉到更复杂的模式；
+
+**门控机制：**引入门控机制，使得模型能够选择性地通过信息，从而提高模型的表达能力；
+
+**计算效率：**相比GeLU这种复杂的激活函数计算效率要高
+
+1、**为什么SwiGLU在Transformer的FFN层中比ReLU更有效**？
+
+ReLU的硬截断特性可能导致梯度消失，而SwiGLU的Swish门控平滑且保留负区间的部分信息，增强了梯度的稳定性；同时，门控机制通过参数化选择重要特征，提升了模型表达能力。
+
+#### 手撕代码
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class SwiGLU(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int):
+        super().__init__()
+        self.w1 = nn.Linear(dim, hidden_dim)
+        self.w2 = nn.Linear(hidden_dim, dim)
+        self.w3 = nn.Linera(dim, hidden_dim)
+        
+    def forward(self, x):
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+```
+
+
+
 ## RLHF（**基于人类反馈的强化学习**）
 
 ### PPO
