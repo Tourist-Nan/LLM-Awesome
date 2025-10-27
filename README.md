@@ -344,6 +344,189 @@ class GroupedQueryAttention(nn.Module):
 
 ### MLA多头隐藏空间注意力
 
+#### 基础概念
+
+![img](https://p.ipic.vip/xfdjeu.jpg)
+
+在论文中提到，每个Transformer层，只缓存了上述公式蓝框的向量： $c_t^{KV}$ 和 $k_t^R$ ，这两个向量的大小分别为 $4 \times d_h$ 和 $d_h / 2$
+
+对比MQA（每层有一个 $d_h$ 维度的 $k$ 和 一个 $d_h$ 维度的 $v$ ，共 $2d_h$ 个元素），MLA相当于增加了2.25倍的存储，但DeepSeek描述自己的方法不仅比MQA强，而且比非共享KV的原始MHA也要强.  
+
+**kv的计算过程**
+
+1、首先公式（41）对输入 $h_t$ 做一个低秩压缩，将 $d$ 维的输入经过 $W^{DKV}$ 变换后压缩成 $d_c$ 维的 。DeepSeek-V3中 $d = 7168$ $d_c = 512$ 
+
+2、然后通过公式（42）和公式（45）两个变换矩阵 $( W^{UK} , W^{UV} \in \mathbb{R}^{d_h n_h \times d_c} ) ,$，将KV的维度扩展回 $d = d_hn_h$，也就是每个Head有一个单独的 $k,v$（跟MHA的KV数量一致）
+
+经过上述的变换，非常类似LoRA做低参数微调的逻辑。通过两个低秩矩阵先做压缩、再做扩展，最终能降低参数的数量。但MLA本质是要做到减少KV-cache的存储。LoRA强调的是参数量的减少，类似MLA这操作确实也减少了参数量，按DeepSeek-V3的参数配置，两个低秩矩阵参数量 $2 \times d_c \times d = 2 \times 512 \times 7168$： *，而正常MHA的参数矩阵参数量：* $d \times d = 7168 \times 7168$
+
+**Q的计算过程**
+
+公式（37），（38）类似KV的逻辑，通过两个矩阵$( W^{DQ} , W^{UQ} \in \mathbb{R}^{d_h n_h \times d_q} )$也做了一层低秩变换，这一步Q的变换看着趋是为了减少模型的参数的数量。在Deepseek-V3里 $d_q = 1536$。是KV压缩维度 的3倍。但相对于 $d = 7168$ 还是压缩了不少。
+
+**q,k增加Rope位置编码**
+
+我们注意到在增加RoPE位置编码并没有在上述计算出的 $q_t^C,k_t^C$ 的基础上乘以RoPE的对角矩阵。而是单独计算了两个带着位置编码的 $$q_t^R,k_t^R$$ 如公式（39）和公式（43）所示
+
+1.  $$q_t^R,k_t^R$$的向量维度 $d_h^R$ 是个比较小的维度，DeepSeek设置为单Attention Head维度的一半： $d_h^R = d_h / 2 = 64$
+
+2. 这部分计算的 $k_t^R$ 实际是个MQA的计算方式，同一层中，所有的Head共享同一 $k$
+
+   然后按如下公式（40），（44）跟已经计算的 $q_t^C,k_t^C$拼接，构成完整的 $q_t,k_t$ 向量。
+
+   所以到目前为止，我们得到的 $q,k$ 包括两部分拼接而成：一部分是做了低秩压缩得到的 $q,k$ 向量，一部分是增加了RoPE位置编码的 $q,k$ 向量。（后面这部分向量是基于MQA方式计算得到的，所有Head共享1个 ）。
+
+   ![img](https://p.ipic.vip/b3l0dm.jpg)
+
+#### 核心优势
+
+1.MLA引入变换矩阵对输入做变换。这个变换矩阵可以通过 $c = f(x)$ 来获得,其中 $f$ 是一个线性变换。通过矩阵乘法的交换律来优化 $c'W_{qc}$ 和$cW_{kc}$，通过预计算 $W_{qc} W_{kc}$，推理时只需要存储变换后的 $c$，而不需要存储 $k$ 和 $v$，从而减少KV Cache的大小。
+
+2.由于这个设计在推理的时候无法直接应用RoPE。MLA巧妙地引入了两个部分:
+
+- 非RoPE部分: 使用$c'W_{qc}$和$cW_{kc}$计算Q和K,保留内容特征
+- RoPE部分: 引入 $W_{qr}$ 和 $W_{kr}$ 来处理位置信息
+
+3.在DeepSeek实现RoPE部分时,MLA使用原始输入 $x$ 而不是 $c$ 来计算K的RoPE部分 $(xW_{kr})$，大概是因为使用原始的 $x$ 不会破坏位置信息。
+
+#### 手撕代码
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from typing import Dict
+
+
+class MultiheadLatentAttention(nn.Module):
+    def __init__(self, args: Dict):
+        super().__init__()
+        
+        # 基本参数设置
+        self.n_heads = args.n_heads # 头数=128
+        self.d_k = args.d_k  # 非RoPE部分的维度 (128)
+        self.d_r = args.d_r  # RoPE部分的维度 (64)
+        self.d_c = args.d_c  # 低秩投影维度 (512)
+        self.d_c_prime = args.d_c_prime  # Q的低秩投影维度 (1536)
+        self.d_v = args.d_v  # V的输出维度 (128)
+
+        
+        
+        # 定义投影矩阵
+        # 低秩投影 d_c_prime * d_c
+        self.W_c = nn.Linear(args.dim, self.d_c, bias=False)  # W_c
+        # 低秩投影 d_c_prime * d_c_prime
+        self.W_c_prime = nn.Linear(args.dim, self.d_c_prime, bias=False)  # W_c'
+        
+        # Q的投影矩阵 d_c_prime * d_k
+        self.W_qc = nn.ModuleList([
+            nn.Linear(self.d_c_prime, self.d_k, bias=False) 
+            for _ in range(self.n_heads)
+        ])  # W_qc^(s)
+        # Q的RoPE投影矩阵 d_c_prime * d_r
+        self.W_qr = nn.ModuleList([
+            nn.Linear(self.d_c_prime, self.d_r, bias=False)
+            for _ in range(self.n_heads)
+        ])  # W_qr^(s)
+        
+        # K的投影矩阵 d_c * d_k
+        self.W_kc = nn.ModuleList([
+            nn.Linear(self.d_c, self.d_k, bias=False)
+            for _ in range(self.n_heads)
+        ])  # W_kc^(s)
+        # K的RoPE投影矩阵 d_c * d_r
+        self.W_kr = nn.Linear(args.dim, self.d_r, bias=False)  # W_kr
+        
+        # V的投影矩阵 d_c * d_v
+        self.W_v = nn.ModuleList([
+            nn.Linear(self.d_c, self.d_v, bias=False)
+            for _ in range(self.n_heads)
+        ])  # W_v^(s)
+        
+        # Dropout层
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        
+        # KV缓存
+        self.c_cache = None  # 低秩投影后的缓存
+        self.x_cache = None  # 原始输入的缓存
+        
+        # 注意力掩码
+        max_seq_len = args.max_seq_len
+        attn_mask = torch.full((1, 1, max_seq_len, max_seq_len), float("-inf"))
+        self.register_buffer("attn_mask", torch.triu(attn_mask, diagonal=1), persistent=False)
+
+    def precompute_matrices(self):
+        # 推理阶段使用的预计算矩阵, W_qc^(s) * W_kc^(s)
+        self.merged_W_qc_kc = [
+            torch.matmul(self.W_qc[i].weight, self.W_kc[i].weight.t())
+            for i in range(self.n_heads)
+        ]
+
+    def forward(self, x, rotary_emb=None, kv_cache=False):
+        batch_size, seq_len, _ = x.shape
+        
+        # 低秩投影
+        c = self.W_c(x)  # [batch_size, seq_len, d_c]
+        c_prime = self.W_c_prime(x)  # [batch_size, seq_len, d_c_prime]
+        
+        # 缓存处理
+        if kv_cache and not self.training:
+            has_cache = self.c_cache is not None and self.x_cache is not None
+            if seq_len == 1 and has_cache:
+                c = torch.cat((self.c_cache, c), dim=1)
+                x = torch.cat((self.x_cache, x), dim=1)
+            self.c_cache = c
+            self.x_cache = x
+            
+        outputs = []
+        for head in range(self.n_heads):
+            if not self.training:  # 推理模式
+                # 使用预计算的矩阵计算非RoPE部分的注意力得分
+                q_c = torch.matmul(c_prime, self.merged_W_qc_kc[head])  # [batch_size, seq_len, d_c]
+                # 注意: 这里直接使用c而不是k_c，因为我们已经预计算了W_q和W_k的乘积
+                k_c = c
+            else:  # 训练模式
+                # 计算Q和K的非RoPE部分
+                q_c = self.W_qc[head](c_prime)  # c'W_qc^(s)
+                k_c = self.W_kc[head](c)  # cW_kc^(s)
+            
+            # 计算RoPE部分
+            q_r = self.W_qr[head](c_prime)  # c'W_qr^(s)
+            k_r = self.W_kr(x)  # xW_kr
+            
+            # 应用RoPE
+            if rotary_emb is not None:
+                q_r = apply_rope(q_r, rotary_emb)  # c'W_qr^(s)R_i
+                k_r = apply_rope(k_r, rotary_emb)  # xW_krR_i
+            
+            # 拼接Q和K的两个部分
+            q = torch.cat([q_c, q_r], dim=-1)  # [batch_size, seq_len, d_k + d_r]
+            k = torch.cat([k_c, k_r], dim=-1)  # [batch_size, seq_len, d_k + d_r]
+            
+            # 计算注意力分数
+            scale = 1.0 / math.sqrt(self.d_k + self.d_r)
+            attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+            
+            # 添加注意力掩码
+            attn_scores = attn_scores + self.attn_mask[:, :, :seq_len, :seq_len]
+            
+            # 计算注意力概率
+            attn_probs = F.softmax(attn_scores.float(), dim=-1).type_as(q_c)
+            attn_probs = self.attn_dropout(attn_probs)
+            
+            # 计算V和输出
+            v = self.W_v[head](c)  # cW_v^(s)
+            head_output = torch.matmul(attn_probs, v)
+            
+            outputs.append(head_output)
+        
+        # 拼接所有头的输出
+        output = torch.cat(outputs, dim=-1)
+        return self.resid_dropout(output)
+```
+
 
 
 ### SwiGLU激活函数
