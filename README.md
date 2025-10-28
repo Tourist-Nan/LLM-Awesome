@@ -571,6 +571,47 @@ class SwiGLU(nn.Module):
 
 
 
+## SFT（监督微调）
+
+### LoRA
+
+LoRA的做法是在LLM的某些矩阵（ $W \in \mathbb{R}^{d \times k}$ ）旁插入一个和它并行的新的权值矩阵 $\Delta W \in \mathbb{R}^{d \times k}$ ，但是因为模型的低秩性的存在（个人理解：深度学习的矩阵往往是过参数化的，许多问题的内在维度比人们认为的要小的多，而对于某个数据集，内在维度在不同参数量级的模型上差距并不大。），我们可以将$\Delta W $ 拆分成降维矩阵 $A \in \mathbb{R}^{r \times k}$ 和升维矩阵 $B \in \mathbb{R}^{d \times r}$（如图所示），其中 $r \ll \min(d, k)$ ，从而实现了以极小的参数数量训练LLM。在训练时，我们将LLM的参数固定，只训练矩阵 $A$ 和 $B$。根据式(1)，在模型训练完成之后，我们可以直接将  $A$  和 $B$ 加到原参数上，从而在推理时不会产生额外的推理时延。
+$$
+h = W_0 x + \Delta W x = (W_0 + \Delta W) x = W x + B A x \tag{1}
+$$
+<img src="https://p.ipic.vip/9amdx9.jpg" alt="img" style="zoom:50%;" />
+
+在初始化时，$A$ 使用高斯初始化，$B$ 使用的零矩阵 进行的初始化。因为 $r$ 通常是一个非常小的值（实验证明1，2，4，8的效果就非常好），所以LoRA在训练时引入的参数量是非常小的，因此它的训练也是非常高效的，也不会带来显著的显存增加。LoRA要求 $A$ 或者  $B$  其中之一必须使用零矩阵进行初始化，这**样当数据第一次通过网络时，它和预训练的结果是一致的**，不至于直接训歪导致模型坍塌。
+
+LoRA的 $\alpha$ 作用是什么：缩放系数，用于调节低秩更新项的影响力，防止低秩更新的扰动过大。
+
+LoRI：通过将投影矩阵 A 冻结为随机投影，并使用**任务特定掩码**对矩阵 B 进行稀疏化处理，LoRI 在自然语言理解、数学推理、代码生成和安全对齐等多个领域都取得了出色的单任务性能，与 LoRA 相比，其可训练参数最多可减少 95%。
+
+QLoRA：在微调之前，将原模型量化为4-Bit，冻结量化后的模型参数，量化后的主权重不再训练，只保留反量化用于前向传播。LoRA 模块仍保持高精度（FP16/BF16），只训练这些小矩阵。**显存中保存的依然是 4-bit 权重**；**反量化仅在计算时使用小块 FP16 缓冲区（几 MB 级别）**；完成计算后立即释放。
+
+#### LoRA伪代码
+
+```python
+input_dim = 768 # 例如，预训练模型的隐藏大小
+output_dim = 768 # 例如，层的输出大小
+rank = 8 # 低秩适应的等级'r'
+W = ... # 来自预训练网络的权重，形状为 input_dim x output_dim
+W_A = nn.Parameter(torch.empty(input_dim, rank)) # LoRA权重A
+W_B = nn.Parameter(torch.empty(rank, output_dim)) # LoRA权重B
+# 初始化LoRA权重
+nn.init.kaiming_uniform_(W_A, a=math.sqrt(5))
+nn.init.zeros_(W_B)
+
+def regular_forward_matmul(x, W):
+  h = x @ W
+  return h
+
+def lora_forward_matmul(x, W, W_A, W_B):
+  h = x @ W # 常规矩阵乘法
+  h += x @ (W_A @ W_B) * alpha # 使用缩放的LoRA权重
+  return h
+```
+
 ## RLHF（**基于人类反馈的强化学习**）
 
 ### PPO
