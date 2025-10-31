@@ -344,6 +344,80 @@ class GroupedQueryAttention(nn.Module):
 
 ```
 
+### CrossAttention交叉注意力机制
+
+交叉注意力机制一般用于在多模态的学习中，融合多个部分的信息，在这里面一般以**查询方的信息作为Q**（Decoder的输入），信息的提供方作为KV，然后Q与K计算得出信息相关度，再与V进行相乘得到最终的值。
+
+![img](https://p.ipic.vip/y8kj3o.jpg)
+
+#### 手撕代码
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class CrossAttention(nn.Module):
+    """
+    交叉注意力机制实现
+    - Query来自目标序列（如decoder的输入）
+    - Key和Value来自源序列（如encoder的输出）
+    """
+    def __init__(self, dim: int, head_num: int):
+        super().__init__()
+        self.dim = dim
+        self.head_num = head_num
+        assert self.dim % head_num == 0
+        self.head_dim = self.dim // self.head_num
+        
+        # Query投影层 - 来自目标序列
+        self.q = nn.Linear(dim, dim)
+        # Key和Value投影层 - 来自源序列  
+        self.k = nn.Linear(dim, dim)
+        self.v = nn.Linear(dim, dim)
+        
+        # 输出投影层
+        self.fc = nn.Linear(dim, dim)
+    
+    def forward(self, query_seq, key_value_seq, mask=None):
+        """
+        前向传播
+        Args:
+            query_seq: 查询序列 (batch_size, query_len, dim)
+            key_value_seq: 键值序列 (batch_size, kv_len, dim)  
+            mask: 注意力掩码 (batch_size, head_num, query_len, kv_len) 或可广播的形状
+        Returns:
+            输出序列 (batch_size, query_len, dim)
+        """
+        b, query_len, d = query_seq.shape
+        _, kv_len, _ = key_value_seq.shape
+        
+        # 计算Q, K, V
+        q = self.q(query_seq).view(b, query_len, self.head_num, self.head_dim).transpose(1, 2)
+        k = self.k(key_value_seq).view(b, kv_len, self.head_num, self.head_dim).transpose(1, 2)
+        v = self.v(key_value_seq).view(b, kv_len, self.head_num, self.head_dim).transpose(1, 2)
+        
+        # 计算注意力分数
+        attn_score = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        
+        # 应用掩码
+        if mask is not None:
+            attn_score = attn_score.masked_fill(mask == 0, -1e9)
+            
+        # 计算注意力权重
+        attn_weight = F.softmax(attn_score, dim=-1)
+        
+        # 应用注意力权重
+        output = torch.matmul(attn_weight, v)
+        
+        # 重新整形并通过输出投影
+        output = output.transpose(1, 2).contiguous().view(b, query_len, d)
+        
+        return self.fc(output)
+```
+
+
+
 ### MLA多头隐藏空间注意力
 
 #### 基础概念
