@@ -676,7 +676,7 @@ MOE 架构的基本思想是在传统 Transformer 模型中，将每个前馈网
 
 ### DeepSeekMTP
 
-**核心思想**：通过解码阶段的优化，将1-token的生成，转变成multi-token的生成，从而提升训练和推理的性能。具体来说，在训练阶段，一次生成多个后续token，可以一次学习多个位置的label，进而有效提升样本的利用效率，提升训练速度；在推理阶段通过一次生成多个token，实现成倍的推理加速来提升推理性能
+**核心思想**：通过解码阶段的优化，将1-token的生成，转变成multi-token的生成，从而提升训练和推理的性能。具体来说，在训练阶段，一次生成多个后续token，可以一次学习多个位置的label，进而有效提升样本的利用效率，提升训练速度；在推理阶段通过一次生成多个token，实现成倍的推理加速来提升推理性能。
 
 通过 D 个顺序模块预测 D 个额外的token。每个MTP模块由以下组成：
 
@@ -813,6 +813,55 @@ def lora_forward_matmul(x, W, W_A, W_B):
 | 学习方式 |     通过模仿学习已有的输入-输出对      |        通过试错和反馈发现最优策略        |
 | 创新能力 |           受限于数据的多样性           |         可以发现创造性的解决方案         |
 | 人工参与 |         主要在初始数据标注阶段         |            主要在设计奖励阶段            |
+
+### DPO
+
+PPO的单样本损失为：
+$$
+\mathcal{L}_{\text{DPO}}(\theta) = - \log \sigma \left[ \beta \left( \log \pi_{\theta}(y^{+} \mid x) - \log \pi_{\theta}(y^{-} \mid x) \right) - \left( \log \pi_{\text{ref}}(y^{+} \mid x) - \log \pi_{\text{ref}}(y^{-} \mid x) \right) \right]
+$$
+DPO源于强化学习中的RLHF思想，但训练方式是监督学习式的偏好对齐。
+
+它是非交互式的（无需环境采样或在线rollout）。
+
+因此，DPO是一种静态、离线的偏好优化方法。
+
+本质上属于监督微调范式，而非传统在线强化学习。
+
+1、目标：求出“偏好概率”怎么与策略 $\pi_\theta$怎么联系起来
+
+我们希望求出：在给定输入（x）下，模型输出（ $y_1$）比（ $y_2$）更被偏好的概率是多少？也就是：$p*(y_1 > y_2 | x)$
+
+根据BT模型，这个概率大小与两个输出的reward大小有关：
+$$
+p^{*}(y_1 \succ y_2 \mid x) = \frac{\exp(r^{*}(x, y_1))}{\exp(r^{*}(x, y_1)) + \exp(r^{*}(x, y_2))}
+$$
+越大的reward表示越“被偏好”；
+
+用softmax形式写偏好概率，是很自然的选择。
+
+2、接下来要做的：把reward表达成策略的形式，在DPO论文中已经说明，最优策略与reward存在如下关系：
+$$
+r^{*}(x, y) = \beta \log \frac{\pi^{*}(y \mid x)}{\pi_{\text{ref}}(y \mid x)} + \beta \log Z(x)
+$$
+3、把这个 $r^*$ 带入偏好概率公式：
+$$
+p^{*}(y_1 \succ y_2 \mid x) = \frac{\exp\left(\beta \log \frac{\pi^{*}(y_1 \mid x)}{\pi_{\text{ref}}(y_1 \mid x)} + \beta \log Z(x)\right)}{\exp\left(\beta \log \frac{\pi^{*}(y_1 \mid x)}{\pi_{\text{ref}}(y_1 \mid x)} + \beta \log Z(x)\right) + \exp\left(\beta \log \frac{\pi^{*}(y_2 \mid x)}{\pi_{\text{ref}}(y_2 \mid x)} + \beta \log Z(x)\right)}
+$$
+4、分子归一化：
+$$
+p^{*}(y_1 \succ y_2 \mid x) = \frac{1}{1 + \exp\left(\beta \log \frac{\pi^{*}(y_2 \mid x)}{\pi_{\text{ref}}(y_2 \mid x)} - \beta \log \frac{\pi^{*}(y_1 \mid x)}{\pi_{\text{ref}}(y_1 \mid x)}\right)}
+$$
+5、识别sigmoid（ $\sigma$）形式
+$$
+p^{*}(y_1 \succ y_2 \mid x) = \sigma\left(\beta\left[\log \frac{\pi^{*}(y_1 \mid x)}{\pi_{\text{ref}}(y_1 \mid x)} - \log \frac{\pi^{*}(y_2 \mid x)}{\pi_{\text{ref}}(y_2 \mid x)}\right]\right)
+$$
+6、转换为损失形式，其实就是个二分类的交叉熵：$L = -\big[y \log(\sigma(z)) + (1-y)\log(1-\sigma(z))\big]$，在这里里面y始终为1，简化为 $L = -\log(\sigma(z))$
+
+最大化5中的公式可以转换为最小化如下：
+$$
+\mathcal{L}_{\text{DPO}} = - \log \sigma \left( \beta \left[ \log \frac{\pi_{\theta}(y^{+} \mid x)}{\pi_{\text{ref}}(y^{+} \mid x)} - \log \frac{\pi_{\theta}(y^{-} \mid x)}{\pi_{\text{ref}}(y^{-} \mid x)} \right] \right)
+$$
 
 ### PPO
 
