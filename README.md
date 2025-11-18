@@ -863,6 +863,28 @@ $$
 \mathcal{L}_{\text{DPO}} = - \log \sigma \left( \beta \left[ \log \frac{\pi_{\theta}(y^{+} \mid x)}{\pi_{\text{ref}}(y^{+} \mid x)} - \log \frac{\pi_{\theta}(y^{-} \mid x)}{\pi_{\text{ref}}(y^{-} \mid x)} \right] \right)
 $$
 
+#### 简单手撕
+
+```python
+# Pseudocode for Direct Preference Optimization (DPO)
+Initialize reference model π_ref (frozen)
+Initialize policy model πθ
+
+for each batch (x, y_w, y_l) in preference_dataset:
+    # compute log probs under both models
+    logp_w = log πθ(y_w | x)
+    logp_l = log πθ(y_l | x)
+    logp_w_ref = log π_ref(y_w | x)
+    logp_l_ref = log π_ref(y_l | x)
+
+    # compute the DPO loss
+    logits = β * ((logp_w - logp_l) - (logp_w_ref - logp_l_ref))
+    loss = -mean(log_sigmoid(logits))  # maximize preference consistency
+
+    # gradient descent
+    update θ ← θ - η * ∇θ(loss)
+```
+
 ### PPO
 
 PPO代表近端策略优化，它需要以下组件：
@@ -967,6 +989,28 @@ $$
 PPO最终的损失loss：
 ![image-20250909222233990](https://p.ipic.vip/emjd2u.png)
 
+#### 简单手撕
+
+```python
+# Pseudocode for PPO (simplified)
+Initialize policy πθ, value function Vϕ
+
+for iteration in range(K):
+    trajectories = collect_trajectories(πθ_old)
+    for each trajectory:
+        compute advantage A_t = R_t - Vϕ(s_t)
+
+    for epoch in range(update_epochs):
+        for batch in sample_minibatches(trajectories):
+            r_t = πθ(a_t|s_t) / πθ_old(a_t|s_t)
+            L_clip = min(r_t * A_t, clip(r_t, 1-ε, 1+ε) * A_t)
+            L_vf = (Vϕ(s_t) - R_t)^2
+            loss = -E[L_clip - c1 * L_vf + c2 * entropy(πθ)]
+
+            update θ, ϕ by gradient descent
+    θ_old ← θ
+```
+
 ### GRPO
 
 GRPO 相较于 PPO 的主要改进为：
@@ -984,6 +1028,34 @@ GRPO 相较于 PPO 的主要改进为：
 下面是 GRPO 的具体流程，对比图PPO 的流程，二者的主要区别在于 advantage 的计算。
 
 ![img](https://p.ipic.vip/9owr8k.jpg)
+
+#### 简单手撕
+
+```python
+Initialize policy πθ
+
+for iteration in range(K):
+    samples = collect_responses(πθ_old)
+    rewards = reward_model(samples)
+    for each prompt group g:
+        r_g = rewards[g]
+        A_g = (r_g - mean(r_g)) / std(r_g)   # normalize within each group
+
+    for epoch in range(update_epochs):
+        for batch in sample_minibatches(samples):
+            r_t = πθ(a_t|s_t) / πθ_old(a_t|s_t)
+
+            L_clip = min(
+                r_t * A_t,
+                clip(r_t, 1 - ε, 1 + ε) * A_t
+            )
+
+            loss = -E[L_clip + c2 * entropy(πθ)]
+
+            update θ by gradient descent
+    
+    θ_old ← θ
+```
 
 ### DAPO
 
