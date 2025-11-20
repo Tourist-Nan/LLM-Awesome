@@ -471,143 +471,29 @@ class CrossAttention(nn.Module):
 
 3.在DeepSeek实现RoPE部分时,MLA使用原始输入 $x$ 而不是 $c$ 来计算K的RoPE部分 $(xW_{kr})$，大概是因为使用原始的 $x$ 不会破坏位置信息。
 
-#### 手撕代码
+### Flash Attention
+Flash Attention 是一种对 Transformer 中注意力机制计算过程的优化算法。它不改变注意力机制的数学公式（输出数值近似一致），而是通过**分块计算**和**重计算**策略，优化了 GPU 显存IO的效率。
 
-```python
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import math
-from typing import Dict
+为什么能起效果： 因为GPU 计算能力（算力）其实非常强，瓶颈不在于“算得不够快”，而在于“数据搬运得太慢”
+#### 核心思想：IO 复杂度优化
+Flash Attention 的核心在于减少 GPU HBM（高带宽内存）与 SRAM（片上高速缓存）之间的数据交换次数。
+![image-20251120223845697](https://r2img.xianrenzhou.top/pics/2025/11/ee5e2ebfee21e457ffa4e0e165c9864a.png)
+*   **标准 Attention**：需要多次读写 $N \times N$ 的注意力矩阵到 HBM，显存复杂度为 $O(N^2)$。
+*   **Flash Attention**：利用 SRAM 进行分块计算，避免将完整的注意力矩阵写回 HBM，将显存复杂度降低到 $O(N)$。
 
+#### 关键技术
 
-class MultiheadLatentAttention(nn.Module):
-    def __init__(self, args: Dict):
-        super().__init__()
-        
-        # 基本参数设置
-        self.n_heads = args.n_heads # 头数=128
-        self.d_k = args.d_k  # 非RoPE部分的维度 (128)
-        self.d_r = args.d_r  # RoPE部分的维度 (64)
-        self.d_c = args.d_c  # 低秩投影维度 (512)
-        self.d_c_prime = args.d_c_prime  # Q的低秩投影维度 (1536)
-        self.d_v = args.d_v  # V的输出维度 (128)
+1.  **分块计算 (Tiling)**
+    将输入矩阵 Q, K, V 切分为小块，加载到 SRAM 中使用 [Online Softmax](#online-softmax) 进行计算。
 
-        
-        
-        # 定义投影矩阵
-        # 低秩投影 d_c_prime * d_c
-        self.W_c = nn.Linear(args.dim, self.d_c, bias=False)  # W_c
-        # 低秩投影 d_c_prime * d_c_prime
-        self.W_c_prime = nn.Linear(args.dim, self.d_c_prime, bias=False)  # W_c'
-        
-        # Q的投影矩阵 d_c_prime * d_k
-        self.W_qc = nn.ModuleList([
-            nn.Linear(self.d_c_prime, self.d_k, bias=False) 
-            for _ in range(self.n_heads)
-        ])  # W_qc^(s)
-        # Q的RoPE投影矩阵 d_c_prime * d_r
-        self.W_qr = nn.ModuleList([
-            nn.Linear(self.d_c_prime, self.d_r, bias=False)
-            for _ in range(self.n_heads)
-        ])  # W_qr^(s)
-        
-        # K的投影矩阵 d_c * d_k
-        self.W_kc = nn.ModuleList([
-            nn.Linear(self.d_c, self.d_k, bias=False)
-            for _ in range(self.n_heads)
-        ])  # W_kc^(s)
-        # K的RoPE投影矩阵 d_c * d_r
-        self.W_kr = nn.Linear(args.dim, self.d_r, bias=False)  # W_kr
-        
-        # V的投影矩阵 d_c * d_v
-        self.W_v = nn.ModuleList([
-            nn.Linear(self.d_c, self.d_v, bias=False)
-            for _ in range(self.n_heads)
-        ])  # W_v^(s)
-        
-        # Dropout层
-        self.attn_dropout = nn.Dropout(args.dropout)
-        self.resid_dropout = nn.Dropout(args.dropout)
-        
-        # KV缓存
-        self.c_cache = None  # 低秩投影后的缓存
-        self.x_cache = None  # 原始输入的缓存
-        
-        # 注意力掩码
-        max_seq_len = args.max_seq_len
-        attn_mask = torch.full((1, 1, max_seq_len, max_seq_len), float("-inf"))
-        self.register_buffer("attn_mask", torch.triu(attn_mask, diagonal=1), persistent=False)
+2.  **重计算 (Recomputation)**
+    在反向传播时，不存储前向传播的注意力矩阵，而是利用存储在 HBM 中的输出和统计量在 SRAM 中重新计算（和前向过程一样），以时间换空间。
 
-    def precompute_matrices(self):
-        # 推理阶段使用的预计算矩阵, W_qc^(s) * W_kc^(s)
-        self.merged_W_qc_kc = [
-            torch.matmul(self.W_qc[i].weight, self.W_kc[i].weight.t())
-            for i in range(self.n_heads)
-        ]
+3.  <span id="online-softmax"></span>**Online Softmax (基于 Safe Softmax)**
+    为了在分块计算中保持数值稳定性，Flash Attention 使用了 Online Softmax 技巧。下面简要说一下，详细原理见：[FlashAttention 中的 Safe Softmax](https://liumengxuan04.github.io/%E6%8A%80%E6%9C%AF/2025/08/28/%E6%8A%80%E6%9C%AF-FlashAttention-%E4%B8%AD%E7%9A%84-Safe-Softmax-%E4%BB%8E%E6%95%B0%E5%80%BC%E7%A8%B3%E5%AE%9A%E6%80%A7%E5%88%B0%E5%88%86%E5%9D%97%E9%87%8D%E7%BC%A9%E6%94%BE/)
+    *   **Safe Softmax 原理**：为了防止计算 $e^{x_i}$ 时溢出，通常会减去最大值：$\text{Softmax}(x) = \text{Softmax}(x - \max(x))$。
+    *   **Online Softmax**：由于分块计算无法一次性知道全局最大值，Flash Attention 维护局部的最大值和归一化因子，随着块的推进动态更新结果，最终等价于全局 Safe Softmax。
 
-    def forward(self, x, rotary_emb=None, kv_cache=False):
-        batch_size, seq_len, _ = x.shape
-        
-        # 低秩投影
-        c = self.W_c(x)  # [batch_size, seq_len, d_c]
-        c_prime = self.W_c_prime(x)  # [batch_size, seq_len, d_c_prime]
-        
-        # 缓存处理
-        if kv_cache and not self.training:
-            has_cache = self.c_cache is not None and self.x_cache is not None
-            if seq_len == 1 and has_cache:
-                c = torch.cat((self.c_cache, c), dim=1)
-                x = torch.cat((self.x_cache, x), dim=1)
-            self.c_cache = c
-            self.x_cache = x
-            
-        outputs = []
-        for head in range(self.n_heads):
-            if not self.training:  # 推理模式
-                # 使用预计算的矩阵计算非RoPE部分的注意力得分
-                q_c = torch.matmul(c_prime, self.merged_W_qc_kc[head])  # [batch_size, seq_len, d_c]
-                # 注意: 这里直接使用c而不是k_c，因为我们已经预计算了W_q和W_k的乘积
-                k_c = c
-            else:  # 训练模式
-                # 计算Q和K的非RoPE部分
-                q_c = self.W_qc[head](c_prime)  # c'W_qc^(s)
-                k_c = self.W_kc[head](c)  # cW_kc^(s)
-            
-            # 计算RoPE部分
-            q_r = self.W_qr[head](c_prime)  # c'W_qr^(s)
-            k_r = self.W_kr(x)  # xW_kr
-            
-            # 应用RoPE
-            if rotary_emb is not None:
-                q_r = apply_rope(q_r, rotary_emb)  # c'W_qr^(s)R_i
-                k_r = apply_rope(k_r, rotary_emb)  # xW_krR_i
-            
-            # 拼接Q和K的两个部分
-            q = torch.cat([q_c, q_r], dim=-1)  # [batch_size, seq_len, d_k + d_r]
-            k = torch.cat([k_c, k_r], dim=-1)  # [batch_size, seq_len, d_k + d_r]
-            
-            # 计算注意力分数
-            scale = 1.0 / math.sqrt(self.d_k + self.d_r)
-            attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale
-            
-            # 添加注意力掩码
-            attn_scores = attn_scores + self.attn_mask[:, :, :seq_len, :seq_len]
-            
-            # 计算注意力概率
-            attn_probs = F.softmax(attn_scores.float(), dim=-1).type_as(q_c)
-            attn_probs = self.attn_dropout(attn_probs)
-            
-            # 计算V和输出
-            v = self.W_v[head](c)  # cW_v^(s)
-            head_output = torch.matmul(attn_probs, v)
-            
-            outputs.append(head_output)
-        
-        # 拼接所有头的输出
-        output = torch.cat(outputs, dim=-1)
-        return self.resid_dropout(output)
-```
 
 ### SwiGLU激活函数
 
