@@ -471,6 +471,143 @@ class CrossAttention(nn.Module):
 
 3.在DeepSeek实现RoPE部分时,MLA使用原始输入 $x$ 而不是 $c$ 来计算K的RoPE部分 $(xW_{kr})$，大概是因为使用原始的 $x$ 不会破坏位置信息。
 
+#### 手撕代码
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from typing import Dict
+
+
+class MultiheadLatentAttention(nn.Module):
+    def __init__(self, args: Dict):
+        super().__init__()
+        
+        # 基本参数设置
+        self.n_heads = args.n_heads # 头数=128
+        self.d_k = args.d_k  # 非RoPE部分的维度 (128)
+        self.d_r = args.d_r  # RoPE部分的维度 (64)
+        self.d_c = args.d_c  # 低秩投影维度 (512)
+        self.d_c_prime = args.d_c_prime  # Q的低秩投影维度 (1536)
+        self.d_v = args.d_v  # V的输出维度 (128)
+
+        
+        
+        # 定义投影矩阵
+        # 低秩投影 d_c_prime * d_c
+        self.W_c = nn.Linear(args.dim, self.d_c, bias=False)  # W_c
+        # 低秩投影 d_c_prime * d_c_prime
+        self.W_c_prime = nn.Linear(args.dim, self.d_c_prime, bias=False)  # W_c'
+        
+        # Q的投影矩阵 d_c_prime * d_k
+        self.W_qc = nn.ModuleList([
+            nn.Linear(self.d_c_prime, self.d_k, bias=False) 
+            for _ in range(self.n_heads)
+        ])  # W_qc^(s)
+        # Q的RoPE投影矩阵 d_c_prime * d_r
+        self.W_qr = nn.ModuleList([
+            nn.Linear(self.d_c_prime, self.d_r, bias=False)
+            for _ in range(self.n_heads)
+        ])  # W_qr^(s)
+        
+        # K的投影矩阵 d_c * d_k
+        self.W_kc = nn.ModuleList([
+            nn.Linear(self.d_c, self.d_k, bias=False)
+            for _ in range(self.n_heads)
+        ])  # W_kc^(s)
+        # K的RoPE投影矩阵 d_c * d_r
+        self.W_kr = nn.Linear(args.dim, self.d_r, bias=False)  # W_kr
+        
+        # V的投影矩阵 d_c * d_v
+        self.W_v = nn.ModuleList([
+            nn.Linear(self.d_c, self.d_v, bias=False)
+            for _ in range(self.n_heads)
+        ])  # W_v^(s)
+        
+        # Dropout层
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        
+        # KV缓存
+        self.c_cache = None  # 低秩投影后的缓存
+        self.x_cache = None  # 原始输入的缓存
+        
+        # 注意力掩码
+        max_seq_len = args.max_seq_len
+        attn_mask = torch.full((1, 1, max_seq_len, max_seq_len), float("-inf"))
+        self.register_buffer("attn_mask", torch.triu(attn_mask, diagonal=1), persistent=False)
+
+    def precompute_matrices(self):
+        # 推理阶段使用的预计算矩阵, W_qc^(s) * W_kc^(s)
+        self.merged_W_qc_kc = [
+            torch.matmul(self.W_qc[i].weight, self.W_kc[i].weight.t())
+            for i in range(self.n_heads)
+        ]
+
+    def forward(self, x, rotary_emb=None, kv_cache=False):
+        batch_size, seq_len, _ = x.shape
+        
+        # 低秩投影
+        c = self.W_c(x)  # [batch_size, seq_len, d_c]
+        c_prime = self.W_c_prime(x)  # [batch_size, seq_len, d_c_prime]
+        
+        # 缓存处理
+        if kv_cache and not self.training:
+            has_cache = self.c_cache is not None and self.x_cache is not None
+            if seq_len == 1 and has_cache:
+                c = torch.cat((self.c_cache, c), dim=1)
+                x = torch.cat((self.x_cache, x), dim=1)
+            self.c_cache = c
+            self.x_cache = x
+            
+        outputs = []
+        for head in range(self.n_heads):
+            if not self.training:  # 推理模式
+                # 使用预计算的矩阵计算非RoPE部分的注意力得分
+                q_c = torch.matmul(c_prime, self.merged_W_qc_kc[head])  # [batch_size, seq_len, d_c]
+                # 注意: 这里直接使用c而不是k_c，因为我们已经预计算了W_q和W_k的乘积
+                k_c = c
+            else:  # 训练模式
+                # 计算Q和K的非RoPE部分
+                q_c = self.W_qc[head](c_prime)  # c'W_qc^(s)
+                k_c = self.W_kc[head](c)  # cW_kc^(s)
+            
+            # 计算RoPE部分
+            q_r = self.W_qr[head](c_prime)  # c'W_qr^(s)
+            k_r = self.W_kr(x)  # xW_kr
+            
+            # 应用RoPE
+            if rotary_emb is not None:
+                q_r = apply_rope(q_r, rotary_emb)  # c'W_qr^(s)R_i
+                k_r = apply_rope(k_r, rotary_emb)  # xW_krR_i
+            
+            # 拼接Q和K的两个部分
+            q = torch.cat([q_c, q_r], dim=-1)  # [batch_size, seq_len, d_k + d_r]
+            k = torch.cat([k_c, k_r], dim=-1)  # [batch_size, seq_len, d_k + d_r]
+            
+            # 计算注意力分数
+            scale = 1.0 / math.sqrt(self.d_k + self.d_r)
+            attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+            
+            # 添加注意力掩码
+            attn_scores = attn_scores + self.attn_mask[:, :, :seq_len, :seq_len]
+            
+            # 计算注意力概率
+            attn_probs = F.softmax(attn_scores.float(), dim=-1).type_as(q_c)
+            attn_probs = self.attn_dropout(attn_probs)
+            
+            # 计算V和输出
+            v = self.W_v[head](c)  # cW_v^(s)
+            head_output = torch.matmul(attn_probs, v)
+            
+            outputs.append(head_output)
+        
+        # 拼接所有头的输出
+        output = torch.cat(outputs, dim=-1)
+        return self.resid_dropout(output)
+```
 ### Flash Attention
 Flash Attention 是一种对 Transformer 中注意力机制计算过程的优化算法。它不改变注意力机制的数学公式（输出数值近似一致），而是通过**分块计算**和**重计算**策略，优化了 GPU 显存IO的效率。
 
