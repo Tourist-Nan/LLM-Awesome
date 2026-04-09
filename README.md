@@ -1,4 +1,4 @@
-**Typora/Vscode打开体验感更好**
+**Typora / Vscode打开体验感更好**
 
 # 大模型八股
 
