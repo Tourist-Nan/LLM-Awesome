@@ -2,7 +2,79 @@
 
 # 大模型八股
 
-## 大模型基础架构
+## 阅读导航（按主题）
+
+### Part A：基础架构与推理机制
+
+- 输入处理与编码：Tokenizer、RoPE、RoPE扩展策略、RMSNorm、PreNorm/PostNorm
+- 注意力机制与缓存：Causal Mask/Attention Mask、MHA、KV Cache、MQA、GQA、CrossAttention、MLA、Flash Attention
+- 激活函数与专家结构：SwiGLU、DeepSeekMOE
+- 推理加速：DeepSeekMTP
+
+### Part B：训练与对齐
+
+- 训练流程与损失：DeepSeek R1 训练流程、预训练和 SFT 的损失函数
+- 无参适配能力：上下文学习（ICL）
+- 能力回灌机制：自蒸馏（Self-Distillation）
+- 监督微调：SFT、LoRA（含 LoRI、QLoRA、HiRA）
+- 偏好对齐与强化学习：RLHF、DPO、PPO、GRPO、DAPO、GSPO
+
+## 大模型基础架构与推理机制
+
+### 大模型整体结构（先建立全局认知）
+
+从工程实现视角看，一个标准 Decoder-only 大模型通常由以下模块串联而成：
+
+1、输入与嵌入层（Embedding）
+
+- Tokenizer：将原始文本切分为 token 序列，并完成 token id 映射。
+- Token Embedding：把离散 token 映射到连续向量空间。
+- Positional 信息注入：常见是 RoPE，把位置信息编码进 Q/K。
+
+2、Transformer 主干（重复堆叠 N 层）
+
+- Attention 子层：建模 token 间依赖关系。
+- FFN 子层：做非线性特征变换（常见激活函数是 SwiGLU）。
+- Norm 与残差：常见 PreNorm 结构，保证深层训练稳定。
+
+3、输出层（LM Head）
+
+- 将隐藏状态投影到词表维度，得到每个 token 的 logits。
+- 经过 softmax 得到下一 token 概率分布。
+
+4、可选增强模块
+
+- MoE：用稀疏激活专家提升参数规模与性能上限。
+- MTP/Speculative 类思路：优化解码阶段吞吐。
+- KV Cache/Flash Attention：优化长序列推理的延迟与显存。
+
+一句话理解：Embedding 负责“看懂输入”，Transformer 负责“加工语义”，LM Head 负责“给出下一个 token 的概率”。
+
+### 编码与归一化
+
+### Tokenizer（分词器）
+
+Tokenizer 是大模型输入链路的第一步，作用是把自然语言文本转成模型可计算的离散 token id 序列。
+
+1、为什么 Tokenizer 很关键？
+
+- 它决定了“一个词被切成几个 token”，直接影响序列长度、推理成本和训练效率。
+- 它影响多语言、代码、符号场景下的表达能力。
+- 它与词表大小共同决定 Embedding/LM Head 参数规模。
+
+2、常见分词算法
+
+- BPE（Byte Pair Encoding）：通过频繁子串合并构建词表，工程上非常常见。
+- WordPiece：与 BPE 相近，但采用不同的合并评分策略。
+- Unigram：基于概率模型选择子词集合，常见于 SentencePiece。
+
+3、训练与推理中的影响
+
+- 训练：同一语料下，分词粒度会影响 token 总量和训练吞吐。
+- 推理：更细粒度通常带来更长上下文长度与更高时延。
+- 对齐：特殊 token（如 BOS/EOS、系统标记）会影响指令跟随与模板稳定性。
+
+一句话理解：Tokenizer 不只是“切词工具”，而是决定模型输入空间形态与计算成本的底层组件。
 
 ### RoPE旋转位置编码
 
@@ -17,6 +89,30 @@ RoPE（Rotary Position Embedding）的核心在于用**旋转矩阵**在**复数
 2、外推能力：旋转操作的周期性允许模型处理超过训练长度的序列，如训练时使用4K长度，推理可扩展至32K。
 
 3、正交性保持：旋转矩阵是正交矩阵，保持向量模长不变，增强模型训练稳定性。
+
+#### 长上下文扩展策略（RoPE 怎么扩）
+
+当训练长度较短、推理长度更长时，常见做法不是完全重训，而是对 RoPE 频率或位置映射做伸缩。
+
+1、位置插值（Position Interpolation）
+
+- 核心思想：把长上下文的位置索引压缩映射回训练时的有效区间。
+- 直观理解：把“更长的尺子”按比例缩放后再喂给 RoPE。
+- 优点是实现简单、成本低；缺点是过长时可能损失局部细节。
+
+2、NTK-aware Scaling
+
+- 核心思想：按神经切线核（NTK）视角重标定 RoPE 的频率分布，减缓长距离外推失真。
+- 实践上常表现为对 base 或频率项做分段/比例缩放。
+- 相比简单插值，通常在更长上下文下稳定性更好。
+
+3、YaRN（Yet another RoPE extension）
+
+- 核心思想：在 RoPE 扩展时采用更平滑、分段的缩放策略，兼顾短上下文性能与长上下文外推。
+- 常见做法是结合“短段保真 + 长段拉伸”，减少直接硬缩放带来的退化。
+- 工程上常用于把 4K/8K 模型扩到更长上下文，同时尽量不牺牲原能力。
+
+一句话总结：位置插值偏“简单可用”，NTK-aware 偏“理论一致性”，YaRN 偏“工程折中与鲁棒性”。
 
 #### 手撕代码
 
@@ -89,7 +185,7 @@ if __name__ == '__main__':
 
 2、训练稳定性：
 
-​	BathNorm在训练和推理阶段行为不同（训练用batch统计量，推理用移动平均），引入不确定性。
+​	BatchNorm在训练和推理阶段行为不同（训练用batch统计量，推理用移动平均），引入不确定性。
 
 ​	LayerNorm和RMSNorm训练推理一致，更稳定。
 
@@ -97,16 +193,14 @@ if __name__ == '__main__':
 
 ​	BatchNorm在分布式训练中需跨设备同步统计量，通信开销大。
 
-​	LayerNorm和RMSNorm无需跨batch统信，更适合大规模并行训练。
+​	LayerNorm和RMSNorm无需跨batch通信，更适合大规模并行训练。
 
-​	RMSNorm进一步简化计算（只有缩放因子gemma，没有中心化beta），减少参数量，提高吞吐。
+​	RMSNorm进一步简化计算（只有缩放因子gamma，没有中心化beta），减少参数量，提高吞吐。
 
 #### 手撕代码
 
 $$
-\begin{equation}
 \mathrm{RMSNorm}(\mathbf{x}) = \frac{\mathbf{x}}{\sqrt{\frac{1}{d} \sum_{i=1}^{d} x_i^2 + \epsilon}} \odot \mathbf{g}
-\end{equation}
 $$
 
 ```python
@@ -143,6 +237,56 @@ class RMSNorm(torch.nn.Module):
 残差连接保持“恒等映射”主导，梯度传播更平滑。
 
 显著提升训练稳定性，尤其在深层网络中。
+
+### 注意力机制与缓存
+
+### Causal Mask / Attention Mask
+
+在自回归大模型中，Mask 的作用是约束“哪些位置可以互相注意到”，防止信息泄漏并屏蔽无效 token。
+
+1、Causal Mask（因果掩码）
+
+- 目标：保证第 $t$ 个 token 只能看见 $\le t$ 的历史位置，不能看到未来位置。
+- 常见实现：上三角置为 $-\infty$，在 softmax 后未来位置权重变为 0。
+- 作用：满足自回归训练目标，避免训练时“偷看答案”。
+
+2、Attention Mask（注意力掩码）
+
+- 目标：屏蔽 padding、无效区段或不应关注的 token。
+- 在实际系统中，常与 Causal Mask 叠加使用。
+- 在多轮对话或长文档场景，可扩展为更复杂的块状/窗口式掩码。
+
+一句话理解：Causal Mask 决定“时间方向约束”，Attention Mask 决定“有效内容边界”。
+
+### 大模型推理过程（Inference Pipeline）
+
+从在线服务角度，推理通常分为两个阶段：
+
+1、Prefill（上下文编码阶段）
+
+- 输入完整 prompt，一次性并行计算所有历史 token 的表示。
+- 这个阶段计算密集，耗时通常与 prompt 长度近似线性相关。
+- 同时会把各层的 K/V 写入缓存（KV Cache），供后续复用。
+
+2、Decode（自回归生成阶段）
+
+- 每一步只生成 1 个新 token（或少量 token）。
+- 新 token 的 Q 与历史 KV 做注意力，避免重复计算历史部分。
+- 直到命中 EOS、长度上限或停止词。
+
+3、采样与生成策略
+
+- Greedy：每步取最大概率 token，稳定但保守。
+- Top-k / Top-p：限制候选集合后采样，提升多样性。
+- Temperature：控制分布平滑度，越大越发散，越小越确定。
+
+4、性能瓶颈与优化点
+
+- 长 prompt 场景瓶颈常在 Prefill。
+- 长输出场景瓶颈常在 Decode 与 KV 读写。
+- 常见优化：Flash Attention、Paged KV Cache、MQA/GQA、连续批处理（Continuous Batching）。
+
+这也是为什么很多推理优化论文都在围绕“减少内存访问 + 增强并行利用率”展开。
 
 ### MHA多头注意力机制
 
@@ -206,7 +350,7 @@ class MultiHeadAttention(nn.Module):
 
 2、**KV 的优势是什么？**
 
-避免重复计算历史 token 的 K/V，大幅降低推理开销；prefill 阶段后，每一步只需计算新 token 的 Q，再用缓存的 K/V，就能做到 **从 O(n²) 降到 O(n)** 的计算量。
+避免重复计算历史 token 的 K/V，大幅降低推理开销；Prefill 阶段后，每一步只需计算新 token 的 Q，再用缓存的 K/V，就能做到 **从 O(n²) 降到 O(n)** 的计算量。
 
 3、**为什么缓存 K/V，而不缓存 Q？**
 
@@ -444,13 +588,13 @@ class CrossAttention(nn.Module):
 
 **Q的计算过程**
 
-公式（37），（38）类似KV的逻辑，通过两个矩阵$( W^{DQ} , W^{UQ} \in \mathbb{R}^{d_h n_h \times d_q} )$也做了一层低秩变换，这一步Q的变换看着趋是为了减少模型的参数的数量。在Deepseek-V3里 $d_q = 1536$。是KV压缩维度 的3倍。但相对于 $d = 7168$ 还是压缩了不少。
+公式（37），（38）类似KV的逻辑，通过两个矩阵$( W^{DQ} , W^{UQ} \in \mathbb{R}^{d_h n_h \times d_q} )$也做了一层低秩变换，这一步Q的变换看起来是为了减少模型参数数量。在DeepSeek-V3里 $d_q = 1536$，是KV压缩维度的3倍。但相对于 $d = 7168$ 还是压缩了不少。
 
-**q,k增加Rope位置编码**
+**q,k增加RoPE位置编码**
 
-我们注意到在增加RoPE位置编码并没有在上述计算出的 $q_t^C,k_t^C$ 的基础上乘以RoPE的对角矩阵。而是单独计算了两个带着位置编码的 $$q_t^R,k_t^R$$ 如公式（39）和公式（43）所示
+我们注意到在增加RoPE位置编码并没有在上述计算出的 $q_t^C,k_t^C$ 的基础上乘以RoPE的对角矩阵。而是单独计算了两个带着位置编码的 $q_t^R,k_t^R$ 如公式（39）和公式（43）所示
 
-1.  $$q_t^R,k_t^R$$的向量维度 $d_h^R$ 是个比较小的维度，DeepSeek设置为单Attention Head维度的一半： $d_h^R = d_h / 2 = 64$
+1.  $q_t^R,k_t^R$的向量维度 $d_h^R$ 是个比较小的维度，DeepSeek设置为单Attention Head维度的一半： $d_h^R = d_h / 2 = 64$
 
 2. 这部分计算的 $k_t^R$ 实际是个MQA的计算方式，同一层中，所有的Head共享同一 $k$
 
@@ -632,6 +776,9 @@ Flash Attention 的核心在于减少 GPU HBM（高带宽内存）与 SRAM（片
     *   **Online Softmax**：由于分块计算无法一次性知道全局最大值，Flash Attention 维护局部的最大值和归一化因子，随着块的推进动态更新结果，最终等价于全局 Safe Softmax。
 
 
+### 激活函数与专家结构
+
+
 ### SwiGLU激活函数
 
 #### 基础概念
@@ -664,7 +811,7 @@ class SwiGLU(nn.Module):
         super().__init__()
         self.w1 = nn.Linear(dim, hidden_dim)
         self.w2 = nn.Linear(hidden_dim, dim)
-        self.w3 = nn.Linera(dim, hidden_dim)
+        self.w3 = nn.Linear(dim, hidden_dim)
         
     def forward(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
@@ -697,6 +844,8 @@ MOE 架构的基本思想是在传统 Transformer 模型中，将每个前馈网
 
 **引入偏置（Bias）**每个路由专家都会有一个可学习的偏置项。当某个专家长期处于低使用状态时，其偏置会自适应地上调，从而增加其被选中的概率；反之，对于被频繁激活的专家，其偏置会下降，从而降低激活概率。值得注意的是，这个偏置项只用于专家选择过程，即在计算得分时加上偏置，而不会在专家输出加权求和时使用，从而确保了最终输出不受不必要的干扰。
 
+### 推理加速
+
 ### DeepSeekMTP
 
 **核心思想**：通过解码阶段的优化，将1-token的生成，转变成multi-token的生成，从而提升训练和推理的性能。具体来说，在训练阶段，一次生成多个后续token，可以一次学习多个位置的label，进而有效提升样本的利用效率，提升训练速度；在推理阶段通过一次生成多个token，实现成倍的推理加速来提升推理性能。
@@ -715,15 +864,94 @@ MOE 架构的基本思想是在传统 Transformer 模型中，将每个前馈网
 2. **预规划表示**：MTP能够提升模型对未来token编码的预规划能力，从而实现更好的预测性能。
 3. **推理加速：**在推理的时候，如果不删除Head，那么将能够一次预测多个token，然后再根据一些校验规则（如部分前向计算或 logprob 比较）选择保留哪些token作为下一次推理。
 
-### DeepSeek R1的训练流程
+## 大模型训练与对齐
+
+### 大模型训练全流程（Training Pipeline）
+
+从 0 到可用模型，一般经历三层递进：
+
+1、预训练（Pretraining）
+
+- 目标：学习通用语言与知识分布。
+- 数据：大规模无标注文本（网页、书籍、代码等）。
+- 损失：下一 token 预测的交叉熵。
+
+2、指令微调（SFT）
+
+- 目标：让模型学会“按指令完成任务”。
+- 数据：高质量指令-回答对。
+- 结果：可用性显著提升，但“偏好对齐”能力仍有限。
+
+3、偏好对齐（RLHF/DPO/GRPO 等）
+
+- 目标：让回答更符合人类偏好（有用、真实、安全）。
+- 方法：奖励建模 + 强化学习，或直接偏好优化（如 DPO）。
+- 结果：从“能回答”走向“回答更像人希望的样子”。
+
+实践中通常还会补充：
+
+- 课程式数据配比（先易后难）。
+- 持续评测与回流（线上 badcase -> 训练集）。
+- 安全策略训练（拒答边界、风险内容约束）。
+
+一句话理解：预训练解决“懂不懂”，SFT 解决“会不会做”，对齐训练解决“做得像不像人希望的样子”。
+
+### 上下文学习（ICL）
+
+上下文学习（In-Context Learning）是指模型在不更新参数的情况下，只依赖 prompt 中的任务描述、示例和格式约束，在当前上下文中临时学会任务并完成泛化。
+
+1、核心机制
+
+- 本质上利用了大模型在预训练阶段学到的“从上下文归纳规则”的能力。
+- 模型通过 attention 读取前文示例，把示例中的输入输出映射关系迁移到当前样本。
+
+2、典型使用方式
+
+- Zero-shot：只给任务描述，不给示例。
+- Few-shot：给少量高质量示例，约束输出风格和格式。
+- 指令 + 结构化模板：通过固定字段或步骤提示提高稳定性。
+
+3、优缺点
+
+- 优点：灵活、低成本、无需训练、上线迭代快。
+- 局限：对提示词质量敏感，稳定性通常不如 SFT；上下文变长时还会带来额外推理成本。
+
+一句话理解：ICL 是“把学习过程放到上下文里临时完成”，而不是把能力写入参数。
+
+### 自蒸馏（Self-Distillation）
+
+自蒸馏（Self-Distillation）是指模型用自己更强阶段或更高质量输出继续监督自己训练：先通过高成本推理得到更优答案，再把这些结果作为伪标签回灌训练。
+
+1、核心机制
+
+- 先获得“教师信号”：例如多次采样、长链推理、搜索增强，或用更强版本模型生成更优答案。
+- 再做“学生训练”：将高质量输出转成监督数据，继续训练同体系模型。
+
+2、常见收益
+
+- 把“高成本推理时表现出的能力”压缩回参数中。
+- 提升推理能力，减少人工标注依赖。
+- 在部署侧用更低成本获得接近高成本推理的效果。
+
+3、实践注意点
+
+- 伪标签质量决定上限，需做过滤、去重和一致性校验。
+- 要避免错误答案反复回灌导致能力漂移。
+- 常与 SFT、偏好优化联合使用，形成闭环迭代。
+
+一句话理解：自蒸馏是一种“能力回灌与压缩”机制，把昂贵推理能力沉淀成廉价推理能力。
+
+### 训练流程与损失函数
+
+#### DeepSeek R1的训练流程
 
 <img src="https://p.ipic.vip/rrmut2.jpg" alt="img" style="zoom:50%;" />
 
 1、**冷启动**：冷启动的训练数据，采用包含思考过程（CoT）的数据，目的是初步教会模型如何思考，如何“符合人类口味习惯”的思考。加速第二阶段推理场景强化学习的收敛速度。
 
-2、**推理场景强化学习**：这个的强化学习方法和DeepSeek-R1-Zero的方法保持一致，仅新增了一条规则——语言一致性规则，减轻多语言混杂的情况。这一步的目的是增强模型的推理能力。
+2、**推理场景强化学习**：这个阶段的强化学习方法和DeepSeek-R1-Zero的方法保持一致，仅新增了一条规则——语言一致性规则，减轻多语言混杂的情况。这一步的目的是增强模型的推理能力。
 
-3、**数据采样&&SFT**：
+3、**数据采样与SFT**：
 
 阶段 2 强化学习后得到的模型，我们暂且称为DeepSeek-V3-SFT-RL。阶段 3 的采样分为两种数据，一种是推理数据，一种是非推理数据。
 
@@ -735,7 +963,7 @@ MOE 架构的基本思想是在传统 Transformer 模型中，将每个前馈网
 
 第四个步骤，旨在提升模型的有用性和无害性，消除模型的歧视偏见等风险。同时，也精炼其推理能力。具体来说，对于推理数据，沿用阶段2的规则。对于非推理数据，采用奖励模型进行反馈。奖励模型同样基于DeepSeek-V3进行构建，评估模型输出是否符合人类的偏好。经过强化学习后，得到最终的DeepSeek-R1模型。
 
-### 预训练和SFT的损失函数
+#### 预训练和SFT的损失函数
 
 在大模型中，无论是预训练阶段还是SFT阶段，使用的都是如公式（2）所示的交叉熵损失，从信息论的角度，交叉熵衡量的是两个概率分布 $p$（真实分布）和 $q$（预测分布）之间的差异。input token 期望预测出的下一个 token 为真实 token 的平均交叉熵最小。
 $$
@@ -770,9 +998,9 @@ $$
 
 3、惩罚方式不合理，MSE 对错误的 token 惩罚线性，而交叉熵是对数级别惩罚，更符合概率意义。
 
-## SFT（监督微调）
+### SFT（监督微调）
 
-### LoRA
+#### LoRA
 
 LoRA的做法是在LLM的某些矩阵（ $W \in \mathbb{R}^{d \times k}$ ）旁插入一个和它并行的新的权值矩阵 $\Delta W \in \mathbb{R}^{d \times k}$ ，但是因为模型的低秩性的存在（个人理解：深度学习的矩阵往往是过参数化的，许多问题的内在维度比人们认为的要小的多，而对于某个数据集，内在维度在不同参数量级的模型上差距并不大。），我们可以将$\Delta W $ 拆分成降维矩阵 $A \in \mathbb{R}^{r \times k}$ 和升维矩阵 $B \in \mathbb{R}^{d \times r}$（如图所示），其中 $r \ll \min(d, k)$ ，从而实现了以极小的参数数量训练LLM。在训练时，我们将LLM的参数固定，只训练矩阵 $A$ 和 $B$。根据式(1)，在模型训练完成之后，我们可以直接将  $A$  和 $B$ 加到原参数上，从而在推理时不会产生额外的推理时延。
 $$
@@ -780,7 +1008,7 @@ h = W_0 x + \Delta W x = (W_0 + \Delta W) x = W x + B A x \tag{1}
 $$
 <img src="https://p.ipic.vip/9amdx9.jpg" alt="img" style="zoom:50%;" />
 
-在初始化时，$A$ 使用高斯初始化，$B$ 使用的零矩阵 进行的初始化。因为 $r$ 通常是一个非常小的值（实验证明1，2，4，8的效果就非常好），所以LoRA在训练时引入的参数量是非常小的，因此它的训练也是非常高效的，也不会带来显著的显存增加。LoRA要求 $A$ 或者  $B$  其中之一必须使用零矩阵进行初始化，这**样当数据第一次通过网络时，它和预训练的结果是一致的**，不至于直接训歪导致模型坍塌。
+在初始化时，$A$ 使用高斯初始化，$B$ 使用零矩阵进行初始化。因为 $r$ 通常是一个非常小的值（实验证明1，2，4，8的效果就非常好），所以LoRA在训练时引入的参数量是非常小的，因此它的训练也是非常高效的，也不会带来显著的显存增加。LoRA要求 $A$ 或者  $B$  其中之一必须使用零矩阵进行初始化，这样当数据第一次通过网络时，它和预训练的结果是一致的，不至于直接训歪导致模型坍塌。
 
 LoRA的 $\alpha$ 作用是什么：缩放系数，用于调节低秩更新项的影响力，防止低秩更新的扰动过大。
 
@@ -802,7 +1030,7 @@ HiRA：
 
    ![image-20251028211218177](https://p.ipic.vip/49jkl0.png)
 
-#### LoRA伪代码
+##### LoRA伪代码
 
 ```python
 input_dim = 768 # 例如，预训练模型的隐藏大小
@@ -825,9 +1053,9 @@ def lora_forward_matmul(x, W, W_A, W_B):
   return h
 ```
 
-## RLHF（**基于人类反馈的强化学习**）
+### RLHF（**基于人类反馈的强化学习**）
 
-### RFT vs 监督微调（SFT）
+#### RFT vs 监督微调（SFT）
 
 |   特征   |           监督式微调（SFT）            |             强化微调（RFT）              |
 | :------: | :------------------------------------: | :--------------------------------------: |
@@ -837,7 +1065,7 @@ def lora_forward_matmul(x, W, W_A, W_B):
 | 创新能力 |           受限于数据的多样性           |         可以发现创造性的解决方案         |
 | 人工参与 |         主要在初始数据标注阶段         |            主要在设计奖励阶段            |
 
-### DPO
+#### DPO
 
 PPO的单样本损失为：
 $$
@@ -886,7 +1114,7 @@ $$
 \mathcal{L}_{\text{DPO}} = - \log \sigma \left( \beta \left[ \log \frac{\pi_{\theta}(y^{+} \mid x)}{\pi_{\text{ref}}(y^{+} \mid x)} - \log \frac{\pi_{\theta}(y^{-} \mid x)}{\pi_{\text{ref}}(y^{-} \mid x)} \right] \right)
 $$
 
-#### 简单手撕
+##### 简单手撕
 
 ```python
 # Pseudocode for Direct Preference Optimization (DPO)
@@ -908,7 +1136,7 @@ for each batch (x, y_w, y_l) in preference_dataset:
     update θ ← θ - η * ∇θ(loss)
 ```
 
-### PPO
+#### PPO
 
 PPO代表近端策略优化，它需要以下组件：
 
@@ -936,7 +1164,7 @@ PPO的整个流程包含以下六个部分：
 
 6、**更新价值函数（critic）**：训练价值函数，使其更好地预测给定部分响应的奖励。
 
-#### 广义优势估计（GAE）
+##### 广义优势估计（GAE）
 
 我们的策略通过优化**优势函数（advantage function）**来更新。直观地讲，优势函数定义了在特定状态$s_{t}$（即提示 prompt + 到目前为止生成的词）下**选择某个动作**$a_{t}$（即词）**相较于平均动作的优越程度**。优势函数的定义如下：
 $$
@@ -966,10 +1194,10 @@ TD误差（步长为1）：$\delta_{t} = R_{t+1} + \gamma V_{\Phi}(s_{t+1}) - V_
 
 GAE（步长为n）：
 $$
-\begin{align*}
+\begin{aligned}
 A_{t}^{n} &= R_{t+1} + \gamma^2 R_{t+2} + \dots + \gamma^n V_{\Phi}(s_{t+n}) - V_{\Phi}(s_{t}) \\
           &= \sum_{l=1}^{n} \gamma^{l-1} \delta_{t+l-1}
-\end{align*}
+\end{aligned}
 $$
 最终形式：$A_{t}^{\text{GAE}} = \sum_{l=0}^{\infty} (\gamma\lambda)^{l} \delta_{t+l}$
 
@@ -983,14 +1211,14 @@ $\epsilon$: 是一个超参数，用于控制 clip 范围；
 
 $A_{t}^{\text{GAE}}$: 是之前通过 GAE 计算得到的优势值。
 
-#### Critic loss
+##### Critic loss
 
 理论上，我们并没有办法获得真实的折扣回报，因此无法获取 Critic 的明确标签。而在 Actor-Critic 范式中使用包含了真实奖励的折扣回报$\hat{G_t}$ 作为标签。下面是 Critic loss 的计算公式：
 $$
 \mathcal{L}(\Phi) = \mathbb{E}_{t}\left[\max\left(\left(V_{\Phi}(s_{t}) - \hat{G}_{t}\right)^2, \left(\operatorname{clip}\left(V_{\Phi}(s_{t}), V_{\Phi}^{\text{old}}(s_{t}) - \epsilon, V_{\Phi}^{\text{old}}(s_{t}) + \epsilon\right) - \hat{G}_{t}\right)^2\right)\right]
 $$
 
-#### KL散度
+##### KL散度
 
 除了最大化 advantage，PPO 还引入了 KL 惩罚，防止当前策略偏离我们微调前的原始模型太远：
 $$
@@ -1005,14 +1233,14 @@ $$
 
 ![img](https://p.ipic.vip/9cvd0e.jpg)
 
-#### 熵奖励（Entropy Bonus）
+##### 熵奖励（Entropy Bonus）
 
 熵奖励用于鼓励 LLM 探索更多的输出，而不是一味选择概率最高的词：$H(\theta) = -\mathbb{E}_{a_i \sim \pi_{\theta}}\left[\log \pi_{\theta}(a_i | s)\right]$
 
 PPO最终的损失loss：
 ![image-20250909222233990](https://p.ipic.vip/emjd2u.png)
 
-#### 简单手撕
+##### 简单手撕
 
 ```python
 # Pseudocode for PPO (simplified)
@@ -1034,7 +1262,7 @@ for iteration in range(K):
     θ_old ← θ
 ```
 
-### GRPO
+#### GRPO
 
 GRPO 相较于 PPO 的主要改进为：
 
@@ -1052,7 +1280,7 @@ GRPO 相较于 PPO 的主要改进为：
 
 ![img](https://p.ipic.vip/9owr8k.jpg)
 
-#### 简单手撕
+##### 简单手撕
 
 ```python
 Initialize policy πθ
@@ -1080,19 +1308,19 @@ for iteration in range(K):
     θ_old ← θ
 ```
 
-### DAPO
+#### DAPO
 
 DAPO 的出发点非常直接：在实际训练中，GRPO 往往因 clip 范围设置不合理、采样冗余以及长序列梯度被稀释等问题，导致大量训练信号被浪费。针对这些问题，DAPO 逐一提出改进，形成了四个核心优化点。
 $$
-\begin{align*}
+\begin{aligned}
 \mathcal{J}_{\text{DAPO}}(\theta) = \; & \mathbb{E}_{\substack{(q,a) \sim P(Q) \\ \{o_i\}_{i=1}^G \sim \pi_{\theta_{\text{old}}}(O|q)}} \left[ \frac{1}{\sum_{i=1}^{G} |o_i|} \sum_{i=1}^{G} \sum_{t=1}^{|o_i|} \right. \\
 & \left. \min\left(r_{i,t}(\theta)A_i, \operatorname{clip}(r_{i,t}(\theta), 1 - \epsilon_{\text{low}}, 1 + \epsilon_{\text{high}})A_i\right) \right] \\
 & \text{s.t.,} \quad 0 < \left| \{o_i \mid \text{is\_equivalent}(a, o_i)\} \right| < G
-\end{align*}
+\end{aligned}
 $$
 
 
-#### 为什么 DAPO 提高了 $ 1 + \epsilon_{high}$  的上界？
+##### 为什么 DAPO 提高了 $ 1 + \epsilon_{high}$  的上界？
 
 作者发现，如果 clip 的上界$\epsilon$设置过小，会出现这样的问题：当 old policy 对某个 token 的概率很低，而该 token 的 advantage 又是正值（即 old model 恰好采样得非常好），此时当前 policy model 的上涨空间就会受到很大限制，而上涨恰恰是我们希望发生的。
 
@@ -1102,13 +1330,13 @@ $$
 
 Clip-Higher 解决了“好 token 涨幅受限”的问题，但并未触及另一个浪费来源——采样多样性不足。为此，DAPO 引入了 **动态采样**。
 
-#### DAPO - 动态采样
+##### DAPO - 动态采样
 
-DAPO 的第二个创新是 **动态采样**（Dynamic Sampling）。这项技术的背景是：假如一个 query 我们 sample 了 10 次，这 10 次每次都答得很好/或者很差，都取得了 max reward/zero reward，这个时候由于 GRPO 的计算方法，导致这 10 次采样的 advantage 都是 0，所以这些采样所带来的 gradient 就也都是 0；这样做的一个后果就是，实际的有梯度的 sample 要远低于没有梯度 sample 数，导致最后梯度汇集的时候没有收集到足够的信息，从而形成高方差、不稳定的训练，以及 sample 的浪费。需要注意的是，这种现象是在训练初期；以及后期随着训练的进行在不断加强的，因为刚开始时模型效果很差，而训练越到后边模型效果越好，给出满分回答的几率就越大。因此，DAPO 在采集样本时，额外做了一件事：保证每次采样出来的回答，reward 不全是 0 或者 1，如果采样出来的回答全是 0 或者 1 就继续采样，直到不满足为止。这也是损失函数中$\text{s.t.,} \quad 0 < \left| \{o_i \mid \text{is\_equivalent}(a, o_i)\} \right| < G$的来源，它保证同一输入下的采样集合中既包含正确回答，也包含错误回答。
+DAPO 的第二个创新是 **动态采样**（Dynamic Sampling）。这项技术的背景是：假如一个 query 我们 sample 了 10 次，这 10 次每次都答得很好/或者很差，都取得了 max reward / zero reward，这个时候由于 GRPO 的计算方法，导致这 10 次采样的 advantage 都是 0，所以这些采样所带来的 gradient 就也都是 0；这样做的一个后果就是，实际的有梯度的 sample 要远低于没有梯度 sample 数，导致最后梯度汇集的时候没有收集到足够的信息，从而形成高方差、不稳定的训练，以及 sample 的浪费。需要注意的是，这种现象是在训练初期；以及后期随着训练的进行在不断加强的，因为刚开始时模型效果很差，而训练越到后边模型效果越好，给出满分回答的几率就越大。因此，DAPO 在采集样本时，额外做了一件事：保证每次采样出来的回答，reward 不全是 0 或者 1，如果采样出来的回答全是 0 或者 1 就继续采样，直到不满足为止。这也是损失函数中$\text{s.t.,} \quad 0 < \left| \{o_i \mid \text{is\_equivalent}(a, o_i)\} \right| < G$的来源，它保证同一输入下的采样集合中既包含正确回答，也包含错误回答。
 
 除了多样性问题，GRPO 在长回答训练中还有一个隐性缺陷——**token 梯度权重随回答长度增加而被稀释**。DAPO 的第三个改进正是 **Token-Level Gradient Loss**。
 
-#### DAPO - Token-Level Gradient Loss
+##### DAPO - Token-Level Gradient Loss
 
 DAPO 第三个方面的创新是为了解决 GRPO 在训练长回答时 gradient 的权重会随着采样回答的长度变长而下降的问题。首先解释为什么采样长度变长权重会下降。假设采样了 2 次，有一次回答一共有 200 个 token，而另一次回答有 10 个 token。那么根据 GRPO 的计算公式，每次回答的梯度先在 sample 内求平均，再在 batch 内求平均。第一次回答每个 token 的权重是$(1/200) * (1/2)$，而第二个回答每个 token 的权重是$(1/10) * (1/2)$，所以第二次回答的 token 的影响要明显高于第一次回答。再来说采样长度变长权重下降的危害：对于一些比较难的问题，长回答本身就很正常，如果这些回答本身非常好，那么由于长度平均就会导致本来非常有用的梯度信号被稀释；假如回答是不好的，长度长仅仅也是因为重复单词，或者回答冗余词太多，长度归一就导致这次采样本该带来的纠正信号没法正确传递到 policy model 上。总结来说就是：
 
@@ -1121,31 +1349,31 @@ DAPO 第三个方面的创新是为了解决 GRPO 在训练长回答时 gradient
 
 最后一个改进同样与回答长度相关，但关注点不同——它处理的是**过长回答对整体奖励的负面影响**。
 
-#### DAPO - Overlong Reward Shaping
+##### DAPO - Overlong Reward Shaping
 
 DAPO 的第四个改进是在奖励设计中引入 **软惩罚机制**（Soft Punishment）来处理过长回答。具体来说，当生成长度超过第一个预设阈值时，惩罚会随长度线性增加；一旦超过第二个阈值，惩罚将抵消因回答正确获得的所有奖励，相当于将该回答视为无效。这种惩罚是按 token 作用在 reward（即 advantage）上的。
 
 综上，DAPO 在 **Clip-Higher、动态采样、Token-Level Gradient Loss** 和 **Overlong Reward Shaping** 四个方面，对 GRPO 进行了精细化改造，显著提升了训练的效率与稳定性。不过在某些特定架构（尤其是 MoE）下，GRPO 的结构性问题依然存在，这就引出了下一节的 **GSPO**。
 
-### GSPO
+#### GSPO
 
 如果说 **DAPO** 是在 GRPO 框架内做“微调与优化”，那么 **GSPO** 则是直接调整了优化目标的颗粒度——从 *token-level* 跳到 *sequence-level*。这一变化的动机，主要源于在 MoE 架构训练时，GRPO 的重要性采样会引入巨大方差和不稳定性。GSPO 的核心思想是：优化奖励时不再依赖逐个 token 的比值，而是关注整个生成序列的表现，从而降低噪声并提升稳定性。
 
-#### Importance ratio 到底在起什么作用？在 GRPO 里会带来什么问题？
+##### Importance ratio 到底在起什么作用？在 GRPO 里会带来什么问题？
 
 重要性采样存在的意义在于：我们想要估计一个预期的分布，但是我们手上只有另一个 behavior 分布，我们就只能在 behavior policy 下进行采样，通过这个样本，赋予这个重要性权重，来估计出 target policy 下函数的值。但是这种采样的前提在于多次采样，如果只有一次采样，并不能起到分布矫正的作用。问题在于大模型训练过程中，重要性采样都是 per-token 进行的，单个 token 进行的重要性采样是无法起到分布矫正的作用的，相反，这种采样手段反而会带来很大方差的噪声，尤其是在 MoE 这种不稳定的结构下。所以 GRPO 本身这种逐 token 的计算可能不太合理。
 
 Per-token 采样和奖励回复的不匹配：我们的奖励其实是对每个回答整体给出的评价，但是在 per-token 的操作中，我们又把这个奖励平摊到每个 token 上（reward shaping），然后试图在 token 层面逐个做调整，所以这里就发生了一个**优化的目标和奖励目标的颗粒度的差异**。所以既然我们有了 sequence-level 的 reward，我们能不能也把 GRPO 的优化过程改成 sequence-level 的。
 
-#### GRPO 在 MoE 结构上为什么难以收敛？(GRPO 的局限性)
+##### GRPO 在 MoE 结构上为什么难以收敛？(GRPO 的局限性)
 
 **专家激活波动性**是关键问题。因为新旧策略可能激活不同的专家，带来结构性偏差，引起噪声。当更新时${\pi_{{\theta}_{old}}}$，很有可能 Router 也发生了变化，导致新旧策略激活了不同的专家。虽然模型参数只更新了一步，但实际参与计算的专家组合完全不同，导致非常大的输出概率的波动，**导致 clipping 被异常地、频繁地触发。Clip 过后的 token 往往就没有梯度**，而最终留下来的 token 往往是有噪音的。所以这两个概率根本不是在相同结构下产生的，理想中的重要性比率应该反应模型在同一结构下参数变化导致的输出概率变化，但这个比率现在由于专家变化，导致高方差的波动，不可预测，与优化方向无关的噪声。这种高方差会导致梯度估计严重失真，训练不稳定甚至崩溃。
 
-#### GSPO 之前的做法：Routing Replay
+##### GSPO 之前的做法：Routing Replay
 
 Routing Replay 会记录 ${\pi_{{\theta}_{old}}}$ 推理时的路由激活，并在训练时强制 ${\pi_{\theta}}$ 使用相同激活路径。这虽能保证一致性，但对 AI infra 带来非常大的开发工作量和开销；同时对于${\pi_{\theta}}$ ，有可能已经有了更好的 routing path，但是现在却一定要走 的 routing path，导致 training 不是很高效。传统方法会尝试通过 Routing Replay 来缓解专家激活的不一致，但这会带来工程复杂性与效率损失。GSPO 则选择直接规避这一依赖，从根本上降低了训练过程中的结构性方差。
 
-#### GSPO 的损失函数设计
+##### GSPO 的损失函数设计
 
 $$
 \mathcal{J}_{\text{GSPO}}(\theta) = \mathbb{E}_{x \sim \mathcal{D}, \{y_i\}_{i=1}^G \sim \pi_{\theta_{\text{old}}}(\cdot|x)} \left[ \frac{1}{G} \sum_{i=1}^G \min \left( \left( \frac{\pi_\theta(y_i|x)}{\pi_{\theta_{\text{old}}}(y_i|x)} \right)^{\frac{1}{|y_i|}} \hat{A}_i, \text{clip}\left(\left( \frac{\pi_\theta(y_i|x)}{\pi_{\theta_{\text{old}}}(y_i|x)} \right)^{\frac{1}{|y_i|}}, 1-\epsilon, 1+\epsilon\right) \hat{A}_i \right) \right]
@@ -1157,7 +1385,7 @@ $$
 
 GSPO 的算法希望抛弃掉 GRPO 的 token-level objective，而是把 importance rate 直接用在 sequence-level 上，这也就自然得引入了 GSPO 的优化算法目标，即把 token-level 的 importance rate 换成了 sequence-level 的 importance rate。这里对 sequence-level 的重要性做了长度归一化，**这里主要是为了减少方差和统一数值范围。如果不做长度归一化，不同的问题可能回答长度是不一样的，因此 importance rate 可能会对长度很敏感**。这里，由于所有属于同一采样的 token 用到的 importance ratio 都是一样的，所以一旦 clipping 发生，所 clip 掉的将是整个采样到的 sequence，而不是一次采样中的某些 token。长度归一化 $\frac{1}{|y_i|}$  避免长句子几个 token 波动就导致 ratio 爆炸。
 
-#### GSPO 与 GRPO 在梯度上的理论分析
+##### GSPO 与 GRPO 在梯度上的理论分析
 
 从优化目标的定义出发，GSPO 与 GRPO 的主要区别在于重要性比值的定义及其在梯度计算中的作用。
 
