@@ -19,6 +19,12 @@
 - 监督微调：SFT、LoRA（含 LoRI、QLoRA、HiRA）
 - 偏好对齐与强化学习：RLHF、DPO、PPO、GRPO、DAPO、GSPO
 
+### Part C：模型系列深度调研
+
+- [Qwen 系列完整技术演进深度调研报告](qwen/README.md) — 覆盖 Qwen-VL → Qwen2-VL → Qwen2.5-VL → Qwen3-VL → Qwen3-Omni 全系列架构演进与多模态面试考点
+
+---
+
 ## 大模型基础架构与推理机制
 
 ### 大模型整体结构
